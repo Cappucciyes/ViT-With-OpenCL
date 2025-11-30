@@ -150,38 +150,135 @@ void layer_norm(float *input, float *output, Network weight, Network bias)
 void multihead_attn(float *input, float *output,
                     Network in_weight, Network in_bias, Network out_weight, Network out_bias)
 {
+    // loading and building kernel program
+    cl_int err;
+	size_t kernel_source_size;
+	char* kernel_source = get_source_code("multihead.cl", &kernel_source_size);
+	cl_program program = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
+	CHECK_ERROR(err);  
+    
+    err = clBuildProgram(program, 1, &DEVICE, "", NULL, NULL);
+	build_error(program, DEVICE, err);
+	CHECK_ERROR(err);
 
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
 
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     float *Q = (float *)malloc(sizeof(float) * tokens * embed_dim);
+    if (Q == NULL) printf("malloc failed in line %d\n", __LINE__);
     float *K = (float *)malloc(sizeof(float) * tokens * embed_dim);
+    if (K == NULL) printf("malloc failed in line %d\n", __LINE__);
     float *V = (float *)malloc(sizeof(float) * tokens * embed_dim);
+    if (V == NULL) printf("malloc failed in line %d\n", __LINE__);
+    ///*Q, K, V 구하기*/
+    //for (int t = 0; t < tokens; t++)
+    //{
+    //    float sum_q, sum_k, sum_v;
+    //    for (int i = 0; i < embed_dim; i++)
+    //    {
+    //        sum_q = in_bias.data[Q_dim + i], sum_k = in_bias.data[K_dim + i], sum_v = in_bias.data[V_dim + i];
+    //        for (int j = 0; j < embed_dim; j++)
+    //        {
+    //            sum_q += input[t * embed_dim + j] * in_weight.data[(Q_dim + i) * embed_dim + j];
+    //            sum_k += input[t * embed_dim + j] * in_weight.data[(K_dim + i) * embed_dim + j];
+    //            sum_v += input[t * embed_dim + j] * in_weight.data[(V_dim + i) * embed_dim + j];
+    //        }
+    //        Q[t * embed_dim + i] = sum_q;
+    //        K[t * embed_dim + i] = sum_k;
+    //        V[t * embed_dim + i] = sum_v;
+    //    }
+    //}	
 
-    /*Q, K, V 구하기*/
-    for (int t = 0; t < tokens; t++)
-    {
-        float sum_q, sum_k, sum_v;
-        for (int i = 0; i < embed_dim; i++)
-        {
-            sum_q = in_bias.data[Q_dim + i], sum_k = in_bias.data[K_dim + i], sum_v = in_bias.data[V_dim + i];
-            for (int j = 0; j < embed_dim; j++)
-            {
-                sum_q += input[t * embed_dim + j] * in_weight.data[(Q_dim + i) * embed_dim + j];
-                sum_k += input[t * embed_dim + j] * in_weight.data[(K_dim + i) * embed_dim + j];
-                sum_v += input[t * embed_dim + j] * in_weight.data[(V_dim + i) * embed_dim + j];
-            }
-            Q[t * embed_dim + i] = sum_q;
-            K[t * embed_dim + i] = sum_k;
-            V[t * embed_dim + i] = sum_v;
-        }
-    }
+    cl_kernel QKVKernel = clCreateKernel(program, "QKV", &err);
+	CHECK_ERROR(err);
+
+    cl_queue_properties props[] = {
+        CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+        0
+    };
+	cl_command_queue queue= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+	CHECK_ERROR(err);    
+    cl_event writeEvent[4];
+    cl_event execEvent;
+
+    cl_mem inputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
+	CHECK_ERROR(err);
+    cl_mem outputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim * 3), NULL, &err);
+	CHECK_ERROR(err);
+	cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (embed_dim* embed_dim* 3), NULL, &err);
+	CHECK_ERROR(err);
+	cl_mem biasBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (embed_dim * 3), NULL, &err);
+	CHECK_ERROR(err);
+	cl_mem offsetBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(int) * 3, NULL, &err);
+	CHECK_ERROR(err);
+    
+
+    err = clEnqueueWriteBuffer(queue, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(queue, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, writeEvent + 1);
+	CHECK_ERROR(err); 
+	err = clEnqueueWriteBuffer(queue, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* 3), in_bias.data, 0, NULL, writeEvent + 2);
+	CHECK_ERROR(err);
+    cl_int offset[3] = { Q_dim, K_dim, V_dim };
+	err = clEnqueueWriteBuffer(queue, offsetBuf, CL_FALSE, 0, sizeof(int) * (3), offset, 0, NULL, writeEvent + 3);
+	CHECK_ERROR(err);
+
+   	err = clSetKernelArg(QKVKernel, 0, sizeof(cl_mem), &inputBuf);
+	CHECK_ERROR(err);
+    err = clSetKernelArg(QKVKernel, 1, sizeof(cl_mem), &weightBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(QKVKernel, 2, sizeof(cl_mem), &outputBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(QKVKernel, 3, sizeof(cl_mem), &biasBuf);
+    CHECK_ERROR(err);
+	err = clSetKernelArg(QKVKernel, 4, sizeof(cl_mem), &offsetBuf);
+	CHECK_ERROR(err);
+    cl_int rowSize= tokens;
+    err = clSetKernelArg(QKVKernel, 5, sizeof(cl_int), &rowSize);
+    CHECK_ERROR(err);
+    cl_int middleSize = embed_dim;
+    err = clSetKernelArg(QKVKernel, 6, sizeof(cl_int), &middleSize);
+	CHECK_ERROR(err);
+    cl_int colSize= embed_dim;
+    err = clSetKernelArg(QKVKernel, 7, sizeof(cl_int), &colSize);
+    CHECK_ERROR(err);
+    size_t global_size[3] = { tokens, embed_dim, 3 };
+    size_t local_size[3] = { 1,1,1 };
+    err = clEnqueueNDRangeKernel(
+        queue,
+		QKVKernel,
+		3,
+		NULL,
+		global_size,
+		local_size,
+		4,
+		writeEvent,
+		&execEvent); 
+    
+    int readOffset = tokens * embed_dim;
+    size_t bufReadOffset =  readOffset * sizeof(float);
+	size_t bufReadCount = readOffset * sizeof(float); 
+    err = clEnqueueReadBuffer(queue, outputBuf, CL_FALSE, 0, bufReadCount, Q, 1, &execEvent, NULL);
+	CHECK_ERROR(err);
+    err = clEnqueueReadBuffer(queue, outputBuf, CL_FALSE, bufReadOffset, bufReadCount, K, 1, &execEvent, NULL);
+	CHECK_ERROR(err);
+    err = clEnqueueReadBuffer(queue, outputBuf, CL_FALSE, bufReadOffset * 2, bufReadCount, V, 1, &execEvent, NULL);
+	CHECK_ERROR(err);
+    clFinish(queue);
+
+    err = clReleaseMemObject(inputBuf);
+    err = clReleaseMemObject(outputBuf);
+    err = clReleaseMemObject(weightBuf);
+    err = clReleaseMemObject(biasBuf);
+    err = clReleaseMemObject(offsetBuf);
+    // --- 
     int print_tokens = tokens < 5 ? tokens : 5;
     int print_dims = embed_dim < 10 ? embed_dim : 10;
 
     /*Attn 결과를 저장할 버퍼*/
     float *attn_output = (float *)malloc(sizeof(float) * tokens * embed_dim);
+    if (attn_output == NULL) printf("malloc failed in line %d\n", __LINE__);
     for (int i = 0; i < tokens * embed_dim; i++)
         attn_output[i] = 0.0f;
 
@@ -192,7 +289,9 @@ void multihead_attn(float *input, float *output,
 
         // attn_score 저장 공간
         float *scores = (float *)malloc(sizeof(float) * tokens * tokens);
+        if (scores == NULL) printf("malloc failed in line %d\n", __LINE__);
         float *scores_tmp = (float *)malloc(sizeof(float) * tokens * tokens);
+		if (scores_tmp== NULL) printf("malloc failed in line %d\n", __LINE__);
 
         // 각 head에 대해 scaled-dot attn
         for (int i = 0; i < tokens; i++)
@@ -233,6 +332,7 @@ void multihead_attn(float *input, float *output,
 
         // scores와 V를 곱해 head output 계산
         float *head_out = (float *)malloc(sizeof(float) * tokens * head_dim);
+		if (head_out== NULL) printf("malloc failed in line %d\n", __LINE__);
         for (int i = 0; i < tokens; i++)
         {
             for (int d = 0; d < head_dim; d++)
@@ -309,7 +409,7 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     cl_command_queue queue = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, 0, &err);
     CHECK_ERROR(err);
 
-	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY, sizeof(float) * (tokens * out_features), NULL, &err);
+	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
     cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (in_features * out_features ), NULL, &err);
     CHECK_ERROR(err);
@@ -318,8 +418,7 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * out_features, NULL, &err);
     CHECK_ERROR(err);
     
-
-    err = clEnqueueWriteBuffer(queue, weightBuf, CL_FALSE, 0, sizeof(float) * (in_features * out_features ), weight.data , 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(queue, weightBuf, CL_FALSE, 0, sizeof(float) * (in_features * out_features), weight.data , 0, NULL, NULL);
     CHECK_ERROR(err);
     err = clEnqueueWriteBuffer(queue, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, 0, NULL, NULL);
     CHECK_ERROR(err);
@@ -364,11 +463,25 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
 		NULL,
 		NULL);
     CHECK_ERROR(err);
-
+    
+    if (output == NULL) printf("this sucks!\n");
     err = clEnqueueReadBuffer(queue, outBuf, CL_TRUE, 0, sizeof(float) * (tokens * out_features), output, 0, NULL, NULL);
+	CHECK_ERROR(err); 
     err = clReleaseKernel(kernel);
+	CHECK_ERROR(err); 
     err = clReleaseProgram(program);
+	CHECK_ERROR(err); 
     err = clReleaseCommandQueue(queue);
+	CHECK_ERROR(err); 
+
+    err = clReleaseMemObject(outBuf);
+	CHECK_ERROR(err); 
+    err = clReleaseMemObject(biasBuf);
+	CHECK_ERROR(err); 
+    err = clReleaseMemObject(weightBuf);
+	CHECK_ERROR(err); 
+    err = clReleaseMemObject(inputBuf);
+	CHECK_ERROR(err); 
 }
 
 void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias, Network fc2_weight, Network fc2_bias)
@@ -378,15 +491,10 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
     int hidden_dim = ((int)(embed_dim * mlp_ratio));                      // 3072
 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
+	if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
 
-    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true);
-    // GELU 활성화
-    //for (int i = 0; i < tokens * hidden_dim; i++)
-    //{
-    //    fc1_out[i] = gelu(fc1_out[i]);
-    //}
-    // fc2: (tokens, in_dim)
-    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias,false);
+    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
+    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
     free(fc1_out);
 }
 
@@ -397,10 +505,15 @@ void Encoder(float *input, float *output,
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+	if (ln1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
     float *attn_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+	if (attn_out== NULL) printf("malloc failed in line %d\n", __LINE__);
     float *residual = (float *)malloc(sizeof(float) * tokens * embed_dim);
+	if (residual== NULL) printf("malloc failed in line %d\n", __LINE__);
     float *ln2_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+	if (ln2_out== NULL) printf("malloc failed in line %d\n", __LINE__);
     float *mlp_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+	if (mlp_out== NULL) printf("malloc failed in line %d\n", __LINE__);
 
     /*LN1*/
     layer_norm(input, ln1_out, ln1_w, ln1_b);
@@ -496,12 +609,15 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     for (int i = 0; i < 4; i++)
     {
         layer[i] = (float *)malloc(sizeof(float) * size[i]);
+        if (layer[i] == NULL) printf("malloc failed in line %d\n", __LINE__);
     }
     for (int i = 0; i < 12; i++)
     {
         enc_layer[i] = (float *)malloc(sizeof(float) * enc_size);
+        if (enc_layer[i] == NULL) printf("malloc failed in line %d\n", __LINE__);
     }
     enc_output = (float *)malloc(sizeof(float) * enc_size);
+	if (enc_output == NULL) printf("malloc failed in line %d\n", __LINE__);
 
     for (int i = 0; i < image->n; i++)
     {
@@ -580,13 +696,15 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
         /* Token 값 추출 */
         float *cls_token = (float *)malloc(sizeof(float) * embed_dim);
+        if (cls_token == NULL) printf("malloc failed on %d\n", __LINE__);
         float *cls_output = (float *)malloc(sizeof(float) * num_classes);
+        if (cls_output == NULL) printf("malloc failed\n");
         memcpy(cls_token, enc_output, sizeof(float) * embed_dim);
 
         linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151], false);
         /* 확률분포 추출 */
         Softmax(cls_output, probabilities[i], num_classes);
-        printf("picture #%d: %.2f sec\n", i, (double)(clock() - startTime) / CLK_TCK);
+        printf("picture #%d: %.2f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
     }
     err = clReleaseContext(CONTEXT);
     CHECK_ERROR(err);
