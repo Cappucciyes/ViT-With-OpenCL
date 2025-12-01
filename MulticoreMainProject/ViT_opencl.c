@@ -26,6 +26,14 @@
 cl_platform_id PLATFORM;
 cl_device_id DEVICE;
 cl_context CONTEXT;
+cl_program MULTIHEAD_PROGRAM;
+cl_kernel QKV_KERNEL;
+
+cl_program LL_PROGRAM;
+cl_kernel LL_KERNEL;
+
+cl_command_queue LL_QUEUE;
+cl_command_queue QKV_QUEUE;
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
 void Conv2d(float *input, float *output, Network weight, Network bias)
@@ -150,19 +158,9 @@ void layer_norm(float *input, float *output, Network weight, Network bias)
 void multihead_attn(float *input, float *output,
                     Network in_weight, Network in_bias, Network out_weight, Network out_bias)
 {
-    // loading and building kernel program
-    cl_int err;
-	size_t kernel_source_size;
-	char* kernel_source = get_source_code("multihead.cl", &kernel_source_size);
-	cl_program program = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
-	CHECK_ERROR(err);  
-    
-    err = clBuildProgram(program, 1, &DEVICE, "", NULL, NULL);
-	build_error(program, DEVICE, err);
-	CHECK_ERROR(err);
-
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-
+    printf("multihead:\n");
+    printf("tokens :%d embed_dim:%d in_weight:%d in_bais:%d out_weight:%d out_bias:%d\n", tokens, embed_dim, in_weight.size, in_bias.size, out_weight.size,out_weight.size);
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     float *Q = (float *)malloc(sizeof(float) * tokens * embed_dim);
@@ -189,15 +187,12 @@ void multihead_attn(float *input, float *output,
     //        V[t * embed_dim + i] = sum_v;
     //    }
     //}	
-
-    cl_kernel QKVKernel = clCreateKernel(program, "QKV", &err);
-	CHECK_ERROR(err);
-
+    cl_int err;
     cl_queue_properties props[] = {
         CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
         0
     };
-	cl_command_queue queue= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+	QKV_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
 	CHECK_ERROR(err);    
     cl_event writeEvent[4];
     cl_event execEvent;
@@ -214,40 +209,40 @@ void multihead_attn(float *input, float *output,
 	CHECK_ERROR(err);
     
 
-    err = clEnqueueWriteBuffer(queue, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+    err = clEnqueueWriteBuffer(QKV_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(queue, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, writeEvent + 1);
+    err = clEnqueueWriteBuffer(QKV_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, writeEvent + 1);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(queue, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* 3), in_bias.data, 0, NULL, writeEvent + 2);
+	err = clEnqueueWriteBuffer(QKV_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* 3), in_bias.data, 0, NULL, writeEvent + 2);
 	CHECK_ERROR(err);
     cl_int offset[3] = { Q_dim, K_dim, V_dim };
-	err = clEnqueueWriteBuffer(queue, offsetBuf, CL_FALSE, 0, sizeof(int) * (3), offset, 0, NULL, writeEvent + 3);
+	err = clEnqueueWriteBuffer(QKV_QUEUE, offsetBuf, CL_FALSE, 0, sizeof(int) * (3), offset, 0, NULL, writeEvent + 3);
 	CHECK_ERROR(err);
 
-   	err = clSetKernelArg(QKVKernel, 0, sizeof(cl_mem), &inputBuf);
+   	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
 	CHECK_ERROR(err);
-    err = clSetKernelArg(QKVKernel, 1, sizeof(cl_mem), &weightBuf);
+    err = clSetKernelArg(QKV_KERNEL, 1, sizeof(cl_mem), &weightBuf);
     CHECK_ERROR(err);
-    err = clSetKernelArg(QKVKernel, 2, sizeof(cl_mem), &outputBuf);
+    err = clSetKernelArg(QKV_KERNEL, 2, sizeof(cl_mem), &outputBuf);
     CHECK_ERROR(err);
-    err = clSetKernelArg(QKVKernel, 3, sizeof(cl_mem), &biasBuf);
+    err = clSetKernelArg(QKV_KERNEL, 3, sizeof(cl_mem), &biasBuf);
     CHECK_ERROR(err);
-	err = clSetKernelArg(QKVKernel, 4, sizeof(cl_mem), &offsetBuf);
+	err = clSetKernelArg(QKV_KERNEL, 4, sizeof(cl_mem), &offsetBuf);
 	CHECK_ERROR(err);
     cl_int rowSize= tokens;
-    err = clSetKernelArg(QKVKernel, 5, sizeof(cl_int), &rowSize);
+    err = clSetKernelArg(QKV_KERNEL, 5, sizeof(cl_int), &rowSize);
     CHECK_ERROR(err);
     cl_int middleSize = embed_dim;
-    err = clSetKernelArg(QKVKernel, 6, sizeof(cl_int), &middleSize);
+    err = clSetKernelArg(QKV_KERNEL, 6, sizeof(cl_int), &middleSize);
 	CHECK_ERROR(err);
     cl_int colSize= embed_dim;
-    err = clSetKernelArg(QKVKernel, 7, sizeof(cl_int), &colSize);
+    err = clSetKernelArg(QKV_KERNEL, 7, sizeof(cl_int), &colSize);
     CHECK_ERROR(err);
     size_t global_size[3] = { tokens, embed_dim, 3 };
     size_t local_size[3] = { 1,1,1 };
     err = clEnqueueNDRangeKernel(
-        queue,
-		QKVKernel,
+        QKV_QUEUE,
+		QKV_KERNEL,
 		3,
 		NULL,
 		global_size,
@@ -259,13 +254,13 @@ void multihead_attn(float *input, float *output,
     int readOffset = tokens * embed_dim;
     size_t bufReadOffset =  readOffset * sizeof(float);
 	size_t bufReadCount = readOffset * sizeof(float); 
-    err = clEnqueueReadBuffer(queue, outputBuf, CL_FALSE, 0, bufReadCount, Q, 1, &execEvent, NULL);
+    err = clEnqueueReadBuffer(QKV_QUEUE, outputBuf, CL_FALSE, 0, bufReadCount, Q, 1, &execEvent, NULL);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(queue, outputBuf, CL_FALSE, bufReadOffset, bufReadCount, K, 1, &execEvent, NULL);
+    err = clEnqueueReadBuffer(QKV_QUEUE, outputBuf, CL_FALSE, bufReadOffset, bufReadCount, K, 1, &execEvent, NULL);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(queue, outputBuf, CL_FALSE, bufReadOffset * 2, bufReadCount, V, 1, &execEvent, NULL);
+    err = clEnqueueReadBuffer(QKV_QUEUE, outputBuf, CL_FALSE, bufReadOffset * 2, bufReadCount, V, 1, &execEvent, NULL);
 	CHECK_ERROR(err);
-    clFinish(queue);
+    clFinish(QKV_QUEUE);
 
     err = clReleaseMemObject(inputBuf);
     err = clReleaseMemObject(outputBuf);
@@ -396,19 +391,8 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
 	size_t kernel_source_size;
     char* kernel_source = get_source_code("ll.cl", &kernel_source_size);
     cl_program program = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
-    CHECK_ERROR(err);
-
-    // Build Program
-    err = clBuildProgram(program, 1, &DEVICE, "", NULL, NULL);
-    build_error(program, DEVICE, err);
-    CHECK_ERROR(err);
-
-    cl_kernel kernel = clCreateKernel(program, "linear_layer", &err);
-    CHECK_ERROR(err);
-   
-    cl_command_queue queue = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, 0, &err);
-    CHECK_ERROR(err);
-
+    CHECK_ERROR(err); 
+    printf("tokens:%d in_features:%d out_features%d weight:%d bias:%d\n", tokens, in_features, out_features, weight.size, bias.size);
 	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
     cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (in_features * out_features ), NULL, &err);
@@ -418,28 +402,28 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * out_features, NULL, &err);
     CHECK_ERROR(err);
     
-    err = clEnqueueWriteBuffer(queue, weightBuf, CL_FALSE, 0, sizeof(float) * (in_features * out_features), weight.data , 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(LL_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (in_features * out_features), weight.data , 0, NULL, NULL);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(queue, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(LL_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, 0, NULL, NULL);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(queue, biasBuf, CL_FALSE, 0, sizeof(float) * out_features, bias.data, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(LL_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * out_features, bias.data, 0, NULL, NULL);
     CHECK_ERROR(err);
 
-    clFinish(queue);
-	err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &outBuf);
+    clFinish(LL_QUEUE);
+	err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outBuf);
 	CHECK_ERROR(err);
-    err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &weightBuf);
+    err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &weightBuf);
     CHECK_ERROR(err);
-    err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &inputBuf);
+    err = clSetKernelArg(LL_KERNEL, 2, sizeof(cl_mem), &inputBuf);
     CHECK_ERROR(err);
 
-    err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &biasBuf);
+    err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &biasBuf);
     CHECK_ERROR(err);
     cl_int outCount = out_features;
-    err = clSetKernelArg(kernel, 4, sizeof(cl_int), &outCount);
+    err = clSetKernelArg(LL_KERNEL, 4, sizeof(cl_int), &outCount);
     CHECK_ERROR(err);
     cl_int featureCount= in_features;
-    err = clSetKernelArg(kernel, 5, sizeof(cl_int), &featureCount);
+    err = clSetKernelArg(LL_KERNEL, 5, sizeof(cl_int), &featureCount);
     CHECK_ERROR(err);
 
     cl_int activateGelu;
@@ -447,14 +431,14 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
         activateGelu = 1;
     else 
         activateGelu = 0;
-    err = clSetKernelArg(kernel, 6, sizeof(cl_int), &activateGelu);
+    err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &activateGelu);
 	CHECK_ERROR(err); 
 
 	size_t global_size[] = {tokens, out_features};
 	size_t local_size[] = {1,1};
 	err = clEnqueueNDRangeKernel(
-		queue,
-		kernel,
+		LL_QUEUE,
+		LL_KERNEL,
 		2,
 		NULL,
 		global_size,
@@ -465,13 +449,7 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     CHECK_ERROR(err);
     
     if (output == NULL) printf("this sucks!\n");
-    err = clEnqueueReadBuffer(queue, outBuf, CL_TRUE, 0, sizeof(float) * (tokens * out_features), output, 0, NULL, NULL);
-	CHECK_ERROR(err); 
-    err = clReleaseKernel(kernel);
-	CHECK_ERROR(err); 
-    err = clReleaseProgram(program);
-	CHECK_ERROR(err); 
-    err = clReleaseCommandQueue(queue);
+    err = clEnqueueReadBuffer(LL_QUEUE, outBuf, CL_TRUE, 0, sizeof(float) * (tokens * out_features), output, 0, NULL, NULL);
 	CHECK_ERROR(err); 
 
     err = clReleaseMemObject(outBuf);
@@ -618,6 +596,38 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     }
     enc_output = (float *)malloc(sizeof(float) * enc_size);
 	if (enc_output == NULL) printf("malloc failed in line %d\n", __LINE__);
+       
+
+	// for multihead
+	size_t kernel_source_size;
+	char* kernel_source = get_source_code("multihead.cl", &kernel_source_size);
+	MULTIHEAD_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
+	CHECK_ERROR(err);
+
+	err = clBuildProgram(MULTIHEAD_PROGRAM, 1, &DEVICE, "", NULL, NULL);
+	build_error(MULTIHEAD_PROGRAM, DEVICE, err);
+	CHECK_ERROR(err);
+	QKV_KERNEL = clCreateKernel(MULTIHEAD_PROGRAM, "QKV", &err);
+	CHECK_ERROR(err);
+	cl_queue_properties props[] = {
+		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+		0
+	};
+	QKV_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+	CHECK_ERROR(err);    
+    
+    // for ll
+	kernel_source = get_source_code("ll.cl", &kernel_source_size);
+	LL_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
+	CHECK_ERROR(err);
+
+	err = clBuildProgram(LL_PROGRAM, 1, &DEVICE, "", NULL, NULL);
+	build_error(LL_PROGRAM, DEVICE, err);
+	CHECK_ERROR(err);
+	LL_KERNEL = clCreateKernel(LL_PROGRAM, "linear_layer", &err);
+	CHECK_ERROR(err);
+	LL_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, 0, &err);
+    CHECK_ERROR(err);
 
     for (int i = 0; i < image->n; i++)
     {
@@ -629,7 +639,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         /*prepend class token*/
         class_token(layer[1], layer[2], networks[0]);
         /*position embedding*/
-        pos_emb(layer[2], layer[3], networks[3]);
+        pos_emb(layer[2], layer[3], networks[3]); 
+
 
         /*Encoder - 12 Layers*/
         Encoder(layer[3], enc_layer[0],
@@ -705,7 +716,17 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         /* 확률분포 추출 */
         Softmax(cls_output, probabilities[i], num_classes);
         printf("picture #%d: %.2f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
+
+        
     }
+
+    CHECK_ERROR(clReleaseKernel(LL_KERNEL));
+	CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
+	CHECK_ERROR(clReleaseProgram(MULTIHEAD_PROGRAM));
+	CHECK_ERROR(clReleaseProgram(LL_PROGRAM));
+	CHECK_ERROR(clReleaseCommandQueue(QKV_QUEUE));
+	CHECK_ERROR(clReleaseCommandQueue(LL_QUEUE));
+
     err = clReleaseContext(CONTEXT);
     CHECK_ERROR(err);
 }
