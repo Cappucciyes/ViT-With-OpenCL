@@ -17,8 +17,8 @@ int main()
 {
 
     ////////////////////////////////////// Input load //////////////////////////////////////
-    const char *img_filename = "./Data/input-100.bin";
-    //const char *img_filename = "./Data/input-1.bin";
+    //const char *img_filename = "./Data/input-100.bin";
+    const char *img_filename = "./Data/input-1.bin";
     ImageData *images = load_image_data(img_filename);
     if (images == NULL)
         return 1;
@@ -75,14 +75,17 @@ int main()
     int cmp = comparator();
     if (cmp == 0)
     {
+        printf("good");
         printf("Comparator: 두 파일의 내용이 동일합니다.\n");
     }
     else if (cmp > 0)
     {
+        printf("bad1");
         printf("Comparator: 두 파일의 내용에 %d개의 차이가 있습니다.\n", cmp);
     }
     else
     {
+        printf("bad2");
         printf("Comparator: 파일 비교 도중 오류가 발생했습니다.\n");
     }
     return 0;

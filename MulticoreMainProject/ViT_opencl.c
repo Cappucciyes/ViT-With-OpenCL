@@ -34,41 +34,124 @@ cl_kernel LL_KERNEL;
 
 cl_command_queue LL_QUEUE;
 cl_command_queue QKV_QUEUE;
+
+cl_program CONV2D_PROGRAM;
+cl_kernel CONV2D_KERNEL;
+cl_command_queue CONV2D_QUEUE;
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
-void Conv2d(float *input, float *output, Network weight, Network bias)
+//void Conv2d(float *input, float *output, Network weight, Network bias)
+//{
+//    int output_size = img_size / patch_size;
+//
+//    for (int oc = 0; oc < embed_dim; ++oc)
+//    {
+//        for (int oh = 0; oh < output_size; ++oh)
+//        {
+//            for (int ow = 0; ow < output_size; ++ow)
+//            {
+//                float sum = bias.data[oc];
+//
+//                for (int ic = 0; ic < in_chans; ++ic)
+//                {
+//                    for (int kh = 0; kh < patch_size; ++kh)
+//                    {
+//                        for (int kw = 0; kw < patch_size; ++kw)
+//                        {
+//                            int ih = oh * patch_size + kh;
+//                            int iw = ow * patch_size + kw;
+//                            int input_idx = (ic * img_size + ih) * img_size + iw;
+//                            int kernel_idx = ((oc * in_chans + ic) * patch_size + kh) * patch_size + kw;
+//
+//                            sum += input[input_idx] * weight.data[kernel_idx];
+//                        }
+//                    }
+//                }
+//
+//                output[(oc * output_size + oh) * output_size + ow] = sum;
+//            }
+//        }
+//    }
+//}
+
+void Conv2d(float* input, float* output, Network weight, Network bias)
 {
     int output_size = img_size / patch_size;
+    cl_int err;
 
-    for (int oc = 0; oc < embed_dim; ++oc)
-    {
-        for (int oh = 0; oh < output_size; ++oh)
-        {
-            for (int ow = 0; ow < output_size; ++ow)
-            {
-                float sum = bias.data[oc];
+    // 버퍼 생성
+    cl_mem inputBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * img_size * img_size * in_chans, NULL, &err);
+    CHECK_ERROR(err);
 
-                for (int ic = 0; ic < in_chans; ++ic)
-                {
-                    for (int kh = 0; kh < patch_size; ++kh)
-                    {
-                        for (int kw = 0; kw < patch_size; ++kw)
-                        {
-                            int ih = oh * patch_size + kh;
-                            int iw = ow * patch_size + kw;
-                            int input_idx = (ic * img_size + ih) * img_size + iw;
-                            int kernel_idx = ((oc * in_chans + ic) * patch_size + kh) * patch_size + kw;
+    cl_mem outputBuf = clCreateBuffer(CONTEXT, CL_MEM_WRITE_ONLY,
+        sizeof(float) * embed_dim * output_size * output_size, NULL, &err);
+    CHECK_ERROR(err);
 
-                            sum += input[input_idx] * weight.data[kernel_idx];
-                        }
-                    }
-                }
+    cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * weight.size, NULL, &err);
+    CHECK_ERROR(err);
 
-                output[(oc * output_size + oh) * output_size + ow] = sum;
-            }
-        }
-    }
+    cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * bias.size, NULL, &err);
+    CHECK_ERROR(err);
+
+    // 데이터 전송
+    err = clEnqueueWriteBuffer(CONV2D_QUEUE, inputBuf, CL_FALSE, 0,
+        sizeof(float) * img_size * img_size * in_chans, input, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(CONV2D_QUEUE, weightBuf, CL_FALSE, 0,
+        sizeof(float) * weight.size, weight.data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(CONV2D_QUEUE, biasBuf, CL_FALSE, 0,
+        sizeof(float) * bias.size, bias.data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    // 커널 인자 설정
+    err = clSetKernelArg(CONV2D_KERNEL, 0, sizeof(cl_mem), &inputBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(CONV2D_KERNEL, 1, sizeof(cl_mem), &outputBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(CONV2D_KERNEL, 2, sizeof(cl_mem), &weightBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(CONV2D_KERNEL, 3, sizeof(cl_mem), &biasBuf);
+    CHECK_ERROR(err);
+    cl_int imgSize = img_size;
+    err = clSetKernelArg(CONV2D_KERNEL, 4, sizeof(cl_int), &imgSize);
+    CHECK_ERROR(err);
+    cl_int patchSize = patch_size;
+    err = clSetKernelArg(CONV2D_KERNEL, 5, sizeof(cl_int), &patchSize);
+    CHECK_ERROR(err);
+    cl_int inChans = in_chans;
+    err = clSetKernelArg(CONV2D_KERNEL, 6, sizeof(cl_int), &inChans);
+    CHECK_ERROR(err);
+    cl_int embedDim = embed_dim;
+    err = clSetKernelArg(CONV2D_KERNEL, 7, sizeof(cl_int), &embedDim);
+    CHECK_ERROR(err);
+
+    // 커널 실행
+    size_t global_size[3] = { embed_dim, output_size, output_size };
+    size_t local_size[3] = { 1, 1, 1 };
+
+    err = clEnqueueNDRangeKernel(CONV2D_QUEUE, CONV2D_KERNEL, 3, NULL,
+        global_size, local_size, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    // 결과 읽기
+    err = clEnqueueReadBuffer(CONV2D_QUEUE, outputBuf, CL_TRUE, 0,
+        sizeof(float) * embed_dim * output_size * output_size,
+        output, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    // 메모리 해제
+    clReleaseMemObject(inputBuf);
+    clReleaseMemObject(outputBuf);
+    clReleaseMemObject(weightBuf);
+    clReleaseMemObject(biasBuf);
 }
+
 
 void flatten_transpose(float *input, float *output)
 {
@@ -109,13 +192,6 @@ void class_token(float *patch_tokens, float *final_tokens, Network cls_tk)
     // 2. 이후 patch_tokens를 이어붙임
     // final_tokens의 인덱스 embed_dim부터, patch_tokens 전체(embed_dim * num_patches) 복사
     memcpy(final_tokens + embed_dim, patch_tokens, sizeof(float) * embed_dim * num_patches);
-
-    int total_tokens = num_patches + 1; // class token + patch tokens
-    for (int i = 0; i < total_tokens * embed_dim; i++)
-    {
-        //("%f ", final_tokens[i]);
-    }
-    // printf("\n");
 }
 
 void pos_emb(float *input, float *output, Network pos_emb)
@@ -159,8 +235,8 @@ void multihead_attn(float *input, float *output,
                     Network in_weight, Network in_bias, Network out_weight, Network out_bias)
 {
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-    printf("multihead:\n");
-    printf("tokens :%d embed_dim:%d in_weight:%d in_bais:%d out_weight:%d out_bias:%d\n", tokens, embed_dim, in_weight.size, in_bias.size, out_weight.size,out_weight.size);
+    //printf("multihead:\n");
+    //printf("tokens :%d embed_dim:%d in_weight:%d in_bais:%d out_weight:%d out_bias:%d\n", tokens, embed_dim, in_weight.size, in_bias.size, out_weight.size,out_weight.size);
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     float *Q = (float *)malloc(sizeof(float) * tokens * embed_dim);
@@ -278,6 +354,7 @@ void multihead_attn(float *input, float *output,
         attn_output[i] = 0.0f;
 
     /*head별로 attn 수행*/
+    printf("%d %d\n", num_heads, head_dim);
     for (int h = 0; h < num_heads; h++)
     {
         int head_offset = h * head_dim;
@@ -285,8 +362,6 @@ void multihead_attn(float *input, float *output,
         // attn_score 저장 공간
         float *scores = (float *)malloc(sizeof(float) * tokens * tokens);
         if (scores == NULL) printf("malloc failed in line %d\n", __LINE__);
-        float *scores_tmp = (float *)malloc(sizeof(float) * tokens * tokens);
-		if (scores_tmp== NULL) printf("malloc failed in line %d\n", __LINE__);
 
         // 각 head에 대해 scaled-dot attn
         for (int i = 0; i < tokens; i++)
@@ -388,11 +463,7 @@ void multihead_attn(float *input, float *output,
 
 void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, Network weight, Network bias, bool doGelu) {
     cl_int err;
-	size_t kernel_source_size;
-    char* kernel_source = get_source_code("ll.cl", &kernel_source_size);
-    cl_program program = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
-    CHECK_ERROR(err); 
-    printf("tokens:%d in_features:%d out_features%d weight:%d bias:%d\n", tokens, in_features, out_features, weight.size, bias.size);
+    //printf("tokens:%d in_features:%d out_features%d weight:%d bias:%d\n", tokens, in_features, out_features, weight.size, bias.size);
 	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
     cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (in_features * out_features ), NULL, &err);
@@ -451,7 +522,6 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     if (output == NULL) printf("this sucks!\n");
     err = clEnqueueReadBuffer(LL_QUEUE, outBuf, CL_TRUE, 0, sizeof(float) * (tokens * out_features), output, 0, NULL, NULL);
 	CHECK_ERROR(err); 
-
     err = clReleaseMemObject(outBuf);
 	CHECK_ERROR(err); 
     err = clReleaseMemObject(biasBuf);
@@ -469,7 +539,7 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
     int hidden_dim = ((int)(embed_dim * mlp_ratio));                      // 3072
 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
-	if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+	//if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
 
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
     linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
@@ -629,6 +699,18 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	LL_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, 0, &err);
     CHECK_ERROR(err);
 
+    // for conv2d
+    kernel_source = get_source_code("conv2d.cl", &kernel_source_size);
+    CONV2D_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source,
+        &kernel_source_size, &err);
+    CHECK_ERROR(err);
+
+    err = clBuildProgram(CONV2D_PROGRAM, 1, &DEVICE, "", NULL, NULL);
+    build_error(CONV2D_PROGRAM, DEVICE, err);
+    CHECK_ERROR(err);
+    CONV2D_KERNEL = clCreateKernel(CONV2D_PROGRAM, "conv2d_kernel", &err);
+    CONV2D_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, 0, &err);
+
     for (int i = 0; i < image->n; i++)
     {
         double startTime = clock();
@@ -721,11 +803,14 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     }
 
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
-	CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
+    CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
+    CHECK_ERROR(clReleaseKernel(CONV2D_KERNEL));
 	CHECK_ERROR(clReleaseProgram(MULTIHEAD_PROGRAM));
-	CHECK_ERROR(clReleaseProgram(LL_PROGRAM));
+    CHECK_ERROR(clReleaseProgram(LL_PROGRAM));
+    CHECK_ERROR(clReleaseProgram(CONV2D_PROGRAM));
 	CHECK_ERROR(clReleaseCommandQueue(QKV_QUEUE));
-	CHECK_ERROR(clReleaseCommandQueue(LL_QUEUE));
+    CHECK_ERROR(clReleaseCommandQueue(LL_QUEUE));
+    CHECK_ERROR(clReleaseCommandQueue(CONV2D_QUEUE));
 
     err = clReleaseContext(CONTEXT);
     CHECK_ERROR(err);

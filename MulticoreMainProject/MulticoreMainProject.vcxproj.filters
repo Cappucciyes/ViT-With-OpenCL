@@ -61,5 +61,11 @@
     <None Include="multihead.cl">
       <Filter>Source Files\kernels</Filter>
     </None>
+    <None Include="conv2d.cl">
+      <Filter>Source Files\kernels</Filter>
+    </None>
+    <None Include="scaledDotSoftmax.cl">
+      <Filter>Source Files\kernels</Filter>
+    </None>
   </ItemGroup>
 </Project>
