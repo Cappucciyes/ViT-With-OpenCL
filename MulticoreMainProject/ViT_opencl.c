@@ -356,6 +356,9 @@ void multihead_attn(float *input, float *output,
 	// attn_score 저장 공간
 	float *scores = (float *)malloc(sizeof(float) * tokens * tokens * num_heads);
 	if (scores == NULL) printf("malloc failed in line %d\n", __LINE__);
+
+
+    
     // check time
     clock_t startTime = clock();
     // scaled dot
@@ -381,17 +384,16 @@ void multihead_attn(float *input, float *output,
        
     size_t global_SCALED_DOT_size[3] = { tokens, tokens, num_heads };
 	size_t local_SCALED_DOT_size[3] = { 1, 1, 1};
-	err = clEnqueueNDRangeKernel(
-		MULTIHEAD_QUEUE,
-		SCALED_DOT_KERNEL,
-		3,
-		NULL,
-		global_SCALED_DOT_size,
-		local_SCALED_DOT_size,
-		0,
-		NULL,
-		NULL);
-    //CHECK_ERROR(clEnqueueReadBuffer(MULTIHEAD_QUEUE, scoreBuf, CL_TRUE, 0, sizeof(float) * token * token * num_heads, scores, 0, NULL, NULL));
+    err = clEnqueueNDRangeKernel(
+        MULTIHEAD_QUEUE,
+        SCALED_DOT_KERNEL,
+        3,
+        NULL,
+        global_SCALED_DOT_size,
+        local_SCALED_DOT_size,
+        0,
+        NULL,
+        NULL);
     clFinish(MULTIHEAD_QUEUE);
     // softmax
    	CHECK_ERROR(clSetKernelArg(SOFTMAX_KERNEL, 0, sizeof(cl_mem), &scoreBuf));
@@ -411,10 +413,8 @@ void multihead_attn(float *input, float *output,
 		NULL,
 		NULL);
     CHECK_ERROR(err);
-	CHECK_ERROR(clEnqueueReadBuffer(MULTIHEAD_QUEUE, scoreBuf, CL_TRUE, 0, sizeof(float) * tokens * tokens * num_heads, scores, 0, NULL, NULL));
     CHECK_ERROR(clReleaseMemObject(qBuf));
     CHECK_ERROR(clReleaseMemObject(kBuf));
-    CHECK_ERROR(clReleaseMemObject(scoreBuf));
     
     printf("QK to softmax: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
     startTime = clock();
@@ -423,6 +423,8 @@ void multihead_attn(float *input, float *output,
     CHECK_ERROR(err);
     cl_mem vBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
     CHECK_ERROR(err);
+
+    CHECK_ERROR(clEnqueueWriteBuffer(MULTIHEAD_QUEUE, vBuf, CL_TRUE, 0, sizeof(float) * (tokens * embed_dim), V, 0, NULL, NULL));
 
     err = clSetKernelArg(SCORE_V_KERNEL, 0, sizeof(cl_mem), &scoreBuf);
     CHECK_ERROR(err);
@@ -439,20 +441,23 @@ void multihead_attn(float *input, float *output,
     CHECK_ERROR(err);
 
     size_t global_SCORE_V_size[3] = { tokens, head_dim , num_heads };
-    size_t local_SCORE_V_size[3] = { 1,1,1};
+    size_t local_SCORE_V_size[3] = {1,1,1};
 
     err = clEnqueueNDRangeKernel(
         MULTIHEAD_QUEUE,
         SCORE_V_KERNEL,
         3,
         NULL,
-        global_SCALED_DOT_size,
+        global_SCORE_V_size,
         local_SCORE_V_size,
         0,
         NULL,
         NULL);
-    err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, finalOutputBuf, CL_TRUE, 0, tokens* head_dim *num_heads, attn_output,0, NULL, NULL);
+    err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, finalOutputBuf, CL_TRUE, 0, tokens * embed_dim, attn_output,0, NULL, NULL);
     CHECK_ERROR(err);
+    CHECK_ERROR(clReleaseMemObject(finalOutputBuf));
+    CHECK_ERROR(clReleaseMemObject(scoreBuf));
+    CHECK_ERROR(clReleaseMemObject(vBuf));
 
   //  for (int h = 0; h < num_heads; h++)
   //  {
@@ -744,6 +749,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	build_error(MULTIHEAD_PROGRAM, DEVICE, err);
 	CHECK_ERROR(err);
 	QKV_KERNEL = clCreateKernel(MULTIHEAD_PROGRAM, "QKV", &err);
+    printf("%.2f", err);
 	CHECK_ERROR(err);
     SCALED_DOT_KERNEL= clCreateKernel(MULTIHEAD_PROGRAM, "scaledDot", &err);
 	CHECK_ERROR(err);

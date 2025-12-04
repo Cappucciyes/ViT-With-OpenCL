@@ -113,7 +113,7 @@ __kernel void scoreV(
     __global float* output,
     int tokens,
     int embed_dim,
-    const int head_dim
+    int head_dim
     ) {
     int i = get_global_id(0);
     int j = get_global_id(1);
@@ -128,6 +128,9 @@ __kernel void scoreV(
     for (int m = 0; m < tokens; m++) {
         result += score[score_base + m] * v[m * embed_dim + head_offset + j];
     }
-
+    
+    
+    //if (i == tokens-1 && j == head_dim-1)
+    //    printf("%d, %d, %d\n", i, j, k);
     output[out_index] = result;
 }       
