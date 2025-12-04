@@ -31,7 +31,9 @@ cl_program MULTIHEAD_PROGRAM;
 cl_kernel QKV_KERNEL;
 cl_kernel SCALED_DOT_KERNEL;
 cl_kernel SOFTMAX_KERNEL;
+cl_kernel SCORE_V_KERNEL;
 cl_command_queue MULTIHEAD_QUEUE;
+
 
 cl_program LL_PROGRAM;
 cl_kernel LL_KERNEL;
@@ -305,7 +307,7 @@ void multihead_attn(float *input, float *output,
     cl_int rowSize= tokens;
     err = clSetKernelArg(QKV_KERNEL, 5, sizeof(cl_int), &rowSize);
     CHECK_ERROR(err);
-    cl_int middleSize = embed_dim;
+    cl_int middleSize = embed_dim; 
     err = clSetKernelArg(QKV_KERNEL, 6, sizeof(cl_int), &middleSize);
 	CHECK_ERROR(err);
     cl_int colSize= embed_dim;
@@ -415,42 +417,77 @@ void multihead_attn(float *input, float *output,
     CHECK_ERROR(clReleaseMemObject(scoreBuf));
     
     printf("QK to softmax: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
-    //printf("%d %d\n", num_heads, head_dim);
     startTime = clock();
-    for (int h = 0; h < num_heads; h++)
-    {
-		int head_offset = h * head_dim;
-		int offset= h * tokens * tokens;
-        // scores와 V를 곱해 head output 계산
-        float *head_out = (float *)malloc(sizeof(float) * tokens * head_dim);
-		if (head_out== NULL) printf("malloc failed in line %d\n", __LINE__);
-        for (int i = 0; i < tokens; i++)
-        {
-            for (int d = 0; d < head_dim; d++)
-            {
-                float sum = 0.0f;
-                for (int j = 0; j < tokens; j++)
-                {
-                    float x = scores[offset + i * tokens + j];
-                    float y = V[j * embed_dim + head_offset + d];
-                    sum += x * y;
-                }
-                head_out[i * head_dim + d] = sum;
-                //printf("%f\n", sum);
-            }
-        }
 
-        // head_out를 attn_output의 해당 부분에 복사
-        for (int i = 0; i < tokens; i++)
-        {
-            for (int d = 0; d < head_dim; d++)
-            {
-                attn_output[i * embed_dim + head_offset + d] = head_out[i * head_dim + d];
-            }
-        }
+    cl_mem finalOutputBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem vBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
+    CHECK_ERROR(err);
 
-        free(head_out);
-    }
+    err = clSetKernelArg(SCORE_V_KERNEL, 0, sizeof(cl_mem), &scoreBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(SCORE_V_KERNEL, 1, sizeof(cl_mem), &vBuf);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(SCORE_V_KERNEL, 2, sizeof(cl_mem), &finalOutputBuf);
+    CHECK_ERROR(err);
+
+    err = clSetKernelArg(SCORE_V_KERNEL, 3, sizeof(cl_int), &clTokens);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(SCORE_V_KERNEL, 4, sizeof(cl_int), &embedDim);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(SCORE_V_KERNEL, 5, sizeof(cl_int), &headDim);
+    CHECK_ERROR(err);
+
+    size_t global_SCORE_V_size[3] = { tokens, head_dim , num_heads };
+    size_t local_SCORE_V_size[3] = { 1,1,1};
+
+    err = clEnqueueNDRangeKernel(
+        MULTIHEAD_QUEUE,
+        SCORE_V_KERNEL,
+        3,
+        NULL,
+        global_SCALED_DOT_size,
+        local_SCORE_V_size,
+        0,
+        NULL,
+        NULL);
+    err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, finalOutputBuf, CL_TRUE, 0, tokens* head_dim *num_heads, attn_output,0, NULL, NULL);
+    CHECK_ERROR(err);
+
+  //  for (int h = 0; h < num_heads; h++)
+  //  {
+		//int head_offset = h * head_dim;
+		//int offset= h * tokens * tokens;
+  //      // scores와 V를 곱해 head output 계산
+  //      float *head_out = (float *)malloc(sizeof(float) * tokens * head_dim);
+		//if (head_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+  //      for (int i = 0; i < tokens; i++)
+  //      {
+  //          for (int d = 0; d < head_dim; d++)
+  //          {
+  //              float sum = 0.0f;
+  //              for (int j = 0; j < tokens; j++)
+  //              {
+  //                  float x = scores[offset + i * tokens + j];
+  //                  float y = V[j * embed_dim + head_offset + d];
+  //                  sum += x * y;
+  //              }       
+  //              head_out[i * head_dim + d] = sum;   
+  //              //printf("%f\n", sum);
+  //          }
+  //      }
+
+  //      // head_out를 attn_output의 해당 부분에 복사
+  //      for (int i = 0; i < tokens; i++)
+  //      {
+  //          for (int d = 0; d < head_dim; d++)
+  //          {
+  //              attn_output[i * embed_dim + head_offset + d] = head_out[i * head_dim + d];
+  //          }
+  //      }
+
+  //      free(head_out);
+  //  }
     free(scores);
     free(Q);
     free(K);
@@ -712,6 +749,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
 	SOFTMAX_KERNEL= clCreateKernel(MULTIHEAD_PROGRAM, "softMax", &err);
 	CHECK_ERROR(err);
+    SCORE_V_KERNEL = clCreateKernel(MULTIHEAD_PROGRAM, "scoreV", &err);
+    CHECK_ERROR(err);
 
 	cl_queue_properties props[] = {
 		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
@@ -840,6 +879,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
     CHECK_ERROR(clReleaseKernel(SOFTMAX_KERNEL));
     CHECK_ERROR(clReleaseKernel(SCALED_DOT_KERNEL));
+    CHECK_ERROR(clReleaseKernel(SCORE_V_KERNEL));
     CHECK_ERROR(clReleaseKernel(CONV2D_KERNEL));
 	CHECK_ERROR(clReleaseProgram(MULTIHEAD_PROGRAM));
     CHECK_ERROR(clReleaseProgram(LL_PROGRAM));

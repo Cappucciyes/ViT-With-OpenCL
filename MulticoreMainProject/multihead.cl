@@ -107,3 +107,27 @@ __kernel void softMax(
 //     // if (i==tokens-1 && j==tokens-1 && k==get_global_size(2) - 1) printf("softmax[x,y,z]=%f\n", score[currentOffset + i * tokens + j]);
 // }
 
+__kernel void scoreV(
+    __global float* score,
+    __global float* v,
+    __global float* output,
+    int tokens,
+    int embed_dim,
+    const int head_dim
+    ) {
+    int i = get_global_id(0);
+    int j = get_global_id(1);
+    int k = get_global_id(2);
+
+    int head_offset = k * head_dim;
+    int out_index = i * embed_dim + head_offset + j ;
+
+    int score_base = k * tokens * tokens + i * tokens;
+
+    float result = 0;
+    for (int m = 0; m < tokens; m++) {
+        result += score[score_base + m] * v[m * embed_dim + head_offset + j];
+    }
+
+    output[out_index] = result;
+}       
