@@ -26,14 +26,17 @@
 cl_platform_id PLATFORM;
 cl_device_id DEVICE;
 cl_context CONTEXT;
+
 cl_program MULTIHEAD_PROGRAM;
 cl_kernel QKV_KERNEL;
+cl_kernel SCALED_DOT_KERNEL;
+cl_kernel SOFTMAX_KERNEL;
+cl_command_queue MULTIHEAD_QUEUE;
 
 cl_program LL_PROGRAM;
 cl_kernel LL_KERNEL;
-
 cl_command_queue LL_QUEUE;
-cl_command_queue QKV_QUEUE;
+
 
 cl_program CONV2D_PROGRAM;
 cl_kernel CONV2D_KERNEL;
@@ -264,12 +267,6 @@ void multihead_attn(float *input, float *output,
     //    }
     //}	
     cl_int err;
-    cl_queue_properties props[] = {
-        CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
-        0
-    };
-	QKV_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
-	CHECK_ERROR(err);    
     cl_event writeEvent[4];
     cl_event execEvent;
 
@@ -285,14 +282,14 @@ void multihead_attn(float *input, float *output,
 	CHECK_ERROR(err);
     
 
-    err = clEnqueueWriteBuffer(QKV_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(QKV_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, writeEvent + 1);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, writeEvent + 1);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(QKV_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* 3), in_bias.data, 0, NULL, writeEvent + 2);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* 3), in_bias.data, 0, NULL, writeEvent + 2);
 	CHECK_ERROR(err);
     cl_int offset[3] = { Q_dim, K_dim, V_dim };
-	err = clEnqueueWriteBuffer(QKV_QUEUE, offsetBuf, CL_FALSE, 0, sizeof(int) * (3), offset, 0, NULL, writeEvent + 3);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, offsetBuf, CL_FALSE, 0, sizeof(int) * (3), offset, 0, NULL, writeEvent + 3);
 	CHECK_ERROR(err);
 
    	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -317,7 +314,7 @@ void multihead_attn(float *input, float *output,
     size_t global_size[3] = { tokens, embed_dim, 3 };
     size_t local_size[3] = { 1,1,1 };
     err = clEnqueueNDRangeKernel(
-        QKV_QUEUE,
+        MULTIHEAD_QUEUE,
 		QKV_KERNEL,
 		3,
 		NULL,
@@ -330,13 +327,13 @@ void multihead_attn(float *input, float *output,
     int readOffset = tokens * embed_dim;
     size_t bufReadOffset =  readOffset * sizeof(float);
 	size_t bufReadCount = readOffset * sizeof(float); 
-    err = clEnqueueReadBuffer(QKV_QUEUE, outputBuf, CL_FALSE, 0, bufReadCount, Q, 1, &execEvent, NULL);
+    err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, 0, bufReadCount, Q, 1, &execEvent, NULL);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(QKV_QUEUE, outputBuf, CL_FALSE, bufReadOffset, bufReadCount, K, 1, &execEvent, NULL);
+    err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, bufReadOffset, bufReadCount, K, 1, &execEvent, NULL);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(QKV_QUEUE, outputBuf, CL_FALSE, bufReadOffset * 2, bufReadCount, V, 1, &execEvent, NULL);
+    err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, bufReadOffset * 2, bufReadCount, V, 1, &execEvent, NULL);
 	CHECK_ERROR(err);
-    clFinish(QKV_QUEUE);
+    clFinish(MULTIHEAD_QUEUE);
 
     err = clReleaseMemObject(inputBuf);
     err = clReleaseMemObject(outputBuf);
@@ -354,52 +351,76 @@ void multihead_attn(float *input, float *output,
         attn_output[i] = 0.0f;
 
     /*head별로 attn 수행*/
-    printf("%d %d\n", num_heads, head_dim);
+	// attn_score 저장 공간
+	float *scores = (float *)malloc(sizeof(float) * tokens * tokens * num_heads);
+	if (scores == NULL) printf("malloc failed in line %d\n", __LINE__);
+    // check time
+    clock_t startTime = clock();
+    // scaled dot
+    cl_mem qBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem kBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
+	CHECK_ERROR(err);
+    cl_mem scoreBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * tokens * num_heads, NULL, &err);
+    CHECK_ERROR(err);
+
+	CHECK_ERROR(clEnqueueWriteBuffer(MULTIHEAD_QUEUE, qBuf, CL_TRUE, 0, sizeof(float) * (tokens * embed_dim), Q, 0, NULL, NULL));
+	CHECK_ERROR(clEnqueueWriteBuffer(MULTIHEAD_QUEUE, kBuf, CL_TRUE, 0, sizeof(float) * (tokens * embed_dim), K, 0, NULL, NULL));
+    
+	CHECK_ERROR(clSetKernelArg(SCALED_DOT_KERNEL, 0, sizeof(cl_mem), &qBuf));
+	CHECK_ERROR(clSetKernelArg(SCALED_DOT_KERNEL, 1, sizeof(cl_mem), &kBuf));
+	CHECK_ERROR(clSetKernelArg(SCALED_DOT_KERNEL, 2, sizeof(cl_mem), &scoreBuf));
+    cl_int clTokens= tokens; 
+	CHECK_ERROR(clSetKernelArg(SCALED_DOT_KERNEL, 3, sizeof(cl_int), &clTokens));
+    cl_int embedDim= embed_dim;
+	CHECK_ERROR(clSetKernelArg(SCALED_DOT_KERNEL, 4, sizeof(cl_int), &embedDim));
+	cl_int headDim= head_dim;
+	CHECK_ERROR(clSetKernelArg(SCALED_DOT_KERNEL, 5, sizeof(cl_int), &head_dim));
+       
+    size_t global_SCALED_DOT_size[3] = { tokens, tokens, num_heads };
+	size_t local_SCALED_DOT_size[3] = { 1, 1, 1};
+	err = clEnqueueNDRangeKernel(
+		MULTIHEAD_QUEUE,
+		SCALED_DOT_KERNEL,
+		3,
+		NULL,
+		global_SCALED_DOT_size,
+		local_SCALED_DOT_size,
+		0,
+		NULL,
+		NULL);
+    //CHECK_ERROR(clEnqueueReadBuffer(MULTIHEAD_QUEUE, scoreBuf, CL_TRUE, 0, sizeof(float) * token * token * num_heads, scores, 0, NULL, NULL));
+    clFinish(MULTIHEAD_QUEUE);
+    // softmax
+   	CHECK_ERROR(clSetKernelArg(SOFTMAX_KERNEL, 0, sizeof(cl_mem), &scoreBuf));
+	CHECK_ERROR(clSetKernelArg(SOFTMAX_KERNEL, 1, sizeof(cl_int), &headDim));
+	CHECK_ERROR(clSetKernelArg(SOFTMAX_KERNEL, 2, sizeof(cl_int), &clTokens));    
+    
+    size_t global_SOFTMAX_size[3] = { tokens, tokens, num_heads };
+	size_t local_SOFTMAX_size[3] = { 1, tokens, 1};
+	err = clEnqueueNDRangeKernel(
+		MULTIHEAD_QUEUE,
+		SOFTMAX_KERNEL,
+		3,
+		NULL,
+		global_SOFTMAX_size,
+		local_SOFTMAX_size,
+		0,
+		NULL,
+		NULL);
+    CHECK_ERROR(err);
+	CHECK_ERROR(clEnqueueReadBuffer(MULTIHEAD_QUEUE, scoreBuf, CL_TRUE, 0, sizeof(float) * tokens * tokens * num_heads, scores, 0, NULL, NULL));
+    CHECK_ERROR(clReleaseMemObject(qBuf));
+    CHECK_ERROR(clReleaseMemObject(kBuf));
+    CHECK_ERROR(clReleaseMemObject(scoreBuf));
+    
+    printf("QK to softmax: %.2f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    //printf("%d %d\n", num_heads, head_dim);
+    startTime = clock();
     for (int h = 0; h < num_heads; h++)
     {
-        int head_offset = h * head_dim;
-
-        // attn_score 저장 공간
-        float *scores = (float *)malloc(sizeof(float) * tokens * tokens);
-        if (scores == NULL) printf("malloc failed in line %d\n", __LINE__);
-
-        // 각 head에 대해 scaled-dot attn
-        for (int i = 0; i < tokens; i++)
-        {
-            for (int j = 0; j < tokens; j++)
-            {
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++)
-                {
-                    float q = Q[i * embed_dim + head_offset + d];
-                    float k = K[j * embed_dim + head_offset + d];
-                    score += q * k;
-                }
-                scores[i * tokens + j] = score / sqrtf((float)head_dim);
-            }
-        }
-
-        // softmax 적용
-        for (int i = 0; i < tokens; i++)
-        {
-            float max_val = scores[i * tokens];
-            for (int j = 1; j < tokens; j++)
-            {
-                if (scores[i * tokens + j] > max_val)
-                    max_val = scores[i * tokens + j];
-            }
-            float sum_exp = 0.0f;
-            for (int j = 0; j < tokens; j++)
-            {
-                scores[i * tokens + j] = expf(scores[i * tokens + j] - max_val);
-                sum_exp += scores[i * tokens + j];
-            }
-            for (int j = 0; j < tokens; j++)
-            {
-                scores[i * tokens + j] /= sum_exp;
-            }
-        }
-
+		int head_offset = h * head_dim;
+		int offset= h * tokens * tokens;
         // scores와 V를 곱해 head output 계산
         float *head_out = (float *)malloc(sizeof(float) * tokens * head_dim);
 		if (head_out== NULL) printf("malloc failed in line %d\n", __LINE__);
@@ -410,9 +431,12 @@ void multihead_attn(float *input, float *output,
                 float sum = 0.0f;
                 for (int j = 0; j < tokens; j++)
                 {
-                    sum += scores[i * tokens + j] * V[j * embed_dim + head_offset + d];
+                    float x = scores[offset + i * tokens + j];
+                    float y = V[j * embed_dim + head_offset + d];
+                    sum += x * y;
                 }
                 head_out[i * head_dim + d] = sum;
+                //printf("%f\n", sum);
             }
         }
 
@@ -425,10 +449,9 @@ void multihead_attn(float *input, float *output,
             }
         }
 
-        free(scores);
         free(head_out);
     }
-
+    free(scores);
     free(Q);
     free(K);
     free(V);
@@ -447,6 +470,7 @@ void multihead_attn(float *input, float *output,
         }
     }
     free(attn_output);
+    printf("not parallelized part: %.2f sec\n\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
 //float gelu(float x)
@@ -540,9 +564,14 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
 	//if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
-
+    
+    clock_t startTime = clock();
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
+    printf("ll #1: %.2f sec\n", (double)(clock() - startTime) / CLK_TCK);
+
+    startTime = clock();
     linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
+    printf("ll #2: %.2f sec\n", (double)(clock() - startTime) / CLK_TCK);
     free(fc1_out);
 }
 
@@ -679,11 +708,16 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
 	QKV_KERNEL = clCreateKernel(MULTIHEAD_PROGRAM, "QKV", &err);
 	CHECK_ERROR(err);
+    SCALED_DOT_KERNEL= clCreateKernel(MULTIHEAD_PROGRAM, "scaledDot", &err);
+	CHECK_ERROR(err);
+	SOFTMAX_KERNEL= clCreateKernel(MULTIHEAD_PROGRAM, "softMax", &err);
+	CHECK_ERROR(err);
+
 	cl_queue_properties props[] = {
 		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
 		0
 	};
-	QKV_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+	MULTIHEAD_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
 	CHECK_ERROR(err);    
     
     // for ll
@@ -804,11 +838,13 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
+    CHECK_ERROR(clReleaseKernel(SOFTMAX_KERNEL));
+    CHECK_ERROR(clReleaseKernel(SCALED_DOT_KERNEL));
     CHECK_ERROR(clReleaseKernel(CONV2D_KERNEL));
 	CHECK_ERROR(clReleaseProgram(MULTIHEAD_PROGRAM));
     CHECK_ERROR(clReleaseProgram(LL_PROGRAM));
     CHECK_ERROR(clReleaseProgram(CONV2D_PROGRAM));
-	CHECK_ERROR(clReleaseCommandQueue(QKV_QUEUE));
+	CHECK_ERROR(clReleaseCommandQueue(MULTIHEAD_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(LL_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(CONV2D_QUEUE));
 

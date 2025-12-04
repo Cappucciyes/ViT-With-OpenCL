@@ -5,8 +5,8 @@
 #include <math.h>
 
 #define BUFFER_SIZE 1024
-//#define IMAGE_COUNT 100
 #define IMAGE_COUNT 1
+//#define IMAGE_COUNT 1
 
 // 문자열에서 index(label)와 probability 추출
 int parse_line(const char *line, int *label, float *prob)

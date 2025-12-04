@@ -37,7 +37,6 @@
     <None Include="conv2d.cl" />
     <None Include="ll.cl" />
     <None Include="multihead.cl" />
-    <None Include="scaledDotSoftmax.cl" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
