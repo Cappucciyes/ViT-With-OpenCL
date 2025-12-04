@@ -80,6 +80,8 @@ __kernel void softMax(
     // if (i == tokens - 1 && j == tokens - 1 && k == get_global_size(2) - 1) printf("softmax[x,y,z]=%f\n", score[currentOffset + j]);
 }
 
+
+// global memory version
 // __kernel void softMax(__global float *score, int head_dim, int tokens)
 // {
 //     int i = get_global_id(0);
@@ -104,3 +106,4 @@ __kernel void softMax(
 //     // if (i==0 && j==0 && k==0) printf("softmax[0,0,0]=%f\n", score[currentOffset + i * tokens + j]);
 //     // if (i==tokens-1 && j==tokens-1 && k==get_global_size(2) - 1) printf("softmax[x,y,z]=%f\n", score[currentOffset + i * tokens + j]);
 // }
+

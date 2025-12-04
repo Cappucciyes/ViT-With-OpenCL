@@ -54,7 +54,7 @@ int main()
     ViT_opencl(images, network, probabilities);
     //
     end = clock();
-    printf("Elapsed time: %.2f sec\n", (double)(end - start) / CLK_TCK);
+    printf("Elapsed time: %.4f sec\n", (double)(end - start) / CLK_TCK);
 
     int pred_idx = 0;
     for (int i = 0; i < n; i++)

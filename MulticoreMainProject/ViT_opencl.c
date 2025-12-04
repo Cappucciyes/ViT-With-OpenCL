@@ -414,7 +414,7 @@ void multihead_attn(float *input, float *output,
     CHECK_ERROR(clReleaseMemObject(kBuf));
     CHECK_ERROR(clReleaseMemObject(scoreBuf));
     
-    printf("QK to softmax: %.2f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("QK to softmax: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
     //printf("%d %d\n", num_heads, head_dim);
     startTime = clock();
     for (int h = 0; h < num_heads; h++)
@@ -470,7 +470,7 @@ void multihead_attn(float *input, float *output,
         }
     }
     free(attn_output);
-    printf("not parallelized part: %.2f sec\n\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("not parallelized part: %.4f sec\n\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
 //float gelu(float x)
@@ -567,11 +567,11 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
     
     clock_t startTime = clock();
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
-    printf("ll #1: %.2f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("ll #1: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
 
     startTime = clock();
     linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
-    printf("ll #2: %.2f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("ll #2: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
     free(fc1_out);
 }
 
@@ -831,7 +831,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151], false);
         /* 확률분포 추출 */
         Softmax(cls_output, probabilities[i], num_classes);
-        printf("picture #%d: %.2f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
+        printf("picture #%d: %.4f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
 
         
     }
