@@ -14,12 +14,13 @@ __kernel void linear_layer(
     int i = get_global_id(0);
     int j = get_global_id(1);
 
+
     float result = bias[j];
 
     for (int k = 0; k < featureCount; k ++) {
         result += input[i*featureCount + k] * weight[j * featureCount + k];
     }
-    
+
     if (doGelu == 1)
 		output[i * outCount + j] = gelu(result);
     else
