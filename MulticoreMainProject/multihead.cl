@@ -9,6 +9,7 @@
     int i = get_global_id(0);
     int j = get_global_id(1);
     int k = get_global_id(2);
+    if (i >= rowSize) return;
     int outputOffset = k * rowSize * embed_dim;
     int currentOffset = k * embed_dim;
 

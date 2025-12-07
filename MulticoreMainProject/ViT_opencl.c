@@ -71,100 +71,12 @@ cl_ulong LAYERNORM_EXEC_TIME;
 cl_ulong LAYERNORM_READ_TIME;
 double LAYERNORM_TOTAL_TIME;
 int LAYERNORM_EXEC_COUNT;
+////////////////////////////////////// utils function //////////////////////////////////////
+void printSpec();
+void profileEvents(cl_event* events, int eventCount, cl_ulong* timeGlobalVariable);
+void printEventProfile();
+
 ////////////////////////////////////// ViT function //////////////////////////////////////
-
-void profileEvents(cl_event *events, int eventCount, cl_ulong* timeGlobalVariable) { 
-    cl_ulong start, end, minStart = ULLONG_MAX, maxEnd = 0;
-    for (int i = 0; i < eventCount; i++) {
-        clGetEventProfilingInfo(events[i], CL_PROFILING_COMMAND_START,
-                               sizeof(cl_ulong), &start, NULL);
-        clGetEventProfilingInfo(events[i], CL_PROFILING_COMMAND_END, 
-                               sizeof(cl_ulong), &end, NULL);
-        if (start < minStart) minStart= start;
-        if (end > maxEnd) maxEnd= end;
-    }
-    cl_ulong total = (maxEnd- minStart);
-
-    *timeGlobalVariable += total;
-}
-
-void printEventProfile() {
-    printf("\n========== PROFILING RESULTS ==========\n");
-    
-    if (LAYERNORM_EXEC_COUNT > 0) {
-        printf("\nLayerNorm (%d executions):\n", LAYERNORM_EXEC_COUNT);
-        printf("  Write: %.6f sec (avg: %.6f sec)\n",
-               LAYERNORM_WRITE_TIME / 1000000000.0,
-               LAYERNORM_WRITE_TIME / 1000000000.0 / LAYERNORM_EXEC_COUNT);
-        printf("  Exec:  %.6f sec (avg: %.6f sec)\n",
-               LAYERNORM_EXEC_TIME / 1000000000.0,
-               LAYERNORM_EXEC_TIME / 1000000000.0 / LAYERNORM_EXEC_COUNT);
-        printf("  Read:  %.6f sec (avg: %.6f sec)\n",
-               LAYERNORM_READ_TIME / 1000000000.0,
-               LAYERNORM_READ_TIME / 1000000000.0 / LAYERNORM_EXEC_COUNT);
-        printf("  Total: %.6f sec (avg: %.6f sec)\n",
-               (LAYERNORM_WRITE_TIME + LAYERNORM_EXEC_TIME + LAYERNORM_READ_TIME) / 1000000000.0,
-               (LAYERNORM_WRITE_TIME + LAYERNORM_EXEC_TIME + LAYERNORM_READ_TIME) / 1000000000.0 / LAYERNORM_EXEC_COUNT);
-    }
-    
-    if (QKV_EXEC_COUNT> 0) {
-        printf("\nMultiHeadAttention (%d executions):\n", QKV_EXEC_COUNT);
-        printf("  Write: %.6f sec (avg: %.6f sec)\n",
-               QKV_WRITE_TIME / 1000000000.0,
-               QKV_WRITE_TIME / 1000000000.0 / QKV_EXEC_COUNT);
-        printf("  Exec(QKV):  %.6f sec (avg: %.6f sec)\n",
-               QKV_EXEC_TIME / 1000000000.0,
-               QKV_EXEC_TIME / 1000000000.0 / QKV_EXEC_COUNT);
-        printf("  Exec(QKV_TO_SCOREV):  %.6f sec (avg: %.6f sec)\n",
-			   QKV_TO_SCORE_EXEC_TIME / 1000000000.0,
-			   QKV_TO_SCORE_EXEC_TIME / 1000000000.0 / QKV_EXEC_COUNT);
-        printf("  Exec(final LL):  %.6f sec (avg: %.6f sec)\n",
-			   QKV_FINAL_LL_EXEC_TIME / 1000000000.0,
-			   QKV_FINAL_LL_EXEC_TIME / 1000000000.0 / QKV_EXEC_COUNT);
-        printf("  Read:  %.6f sec (avg: %.6f sec)\n",
-               QKV_READ_TIME / 1000000000.0,
-               QKV_READ_TIME / 1000000000.0 / QKV_EXEC_COUNT);
-    }
-    
-    if (LL_EXEC_COUNT > 0) {
-        printf("\nLL (%d executions):\n", LL_EXEC_COUNT);
-        printf("  Write: %.6f sec (avg: %.6f sec)\n",
-               LL_WRITE_TIME / 1000000000.0,
-               LL_WRITE_TIME / 1000000000.0 / LL_EXEC_COUNT);
-        printf("  Exec:  %.6f sec (avg: %.6f sec)\n",
-               LL_EXEC_TIME / 1000000000.0,
-               LL_EXEC_TIME / 1000000000.0 / LL_EXEC_COUNT);
-        printf("  Read:  %.6f sec (avg: %.6f sec)\n",
-               LL_READ_TIME / 1000000000.0,
-               LL_READ_TIME / 1000000000.0 / LL_EXEC_COUNT);
-    }
-
-	if (CONV_EXEC_COUNT> 0) {
-		printf("\nCONV (%d executions):\n", CONV_EXEC_COUNT);
-		printf("  Write: %.6f sec (avg: %.6f sec)\n",
-			   CONV_WRITE_TIME / 1000000000.0,
-			   CONV_WRITE_TIME / 1000000000.0 / CONV_EXEC_COUNT);
-		printf("  Exec:  %.6f sec (avg: %.6f sec)\n",
-			   CONV_EXEC_TIME / 1000000000.0,
-			   CONV_EXEC_TIME / 1000000000.0 / CONV_EXEC_COUNT);
-		printf("  Read:  %.6f sec (avg: %.6f sec)\n",
-			   CONV_READ_TIME / 1000000000.0,
-			   CONV_READ_TIME / 1000000000.0 / CONV_EXEC_COUNT);
-	}
-    cl_ulong allwrite= CONV_WRITE_TIME + LL_WRITE_TIME+ QKV_WRITE_TIME + LAYERNORM_WRITE_TIME;
-    cl_ulong allExec= CONV_EXEC_TIME + LL_EXEC_TIME + LAYERNORM_EXEC_TIME + QKV_EXEC_TIME + QKV_TO_SCORE_EXEC_TIME + QKV_FINAL_LL_EXEC_TIME;
-    cl_ulong allRead = CONV_READ_TIME + LL_READ_TIME+ QKV_READ_TIME + LAYERNORM_READ_TIME;
-
-    printf("\nTotal Execution Time By Jobs:\n");
-    printf("  Total write:  %.6f sec \n",
-        allwrite / 1000000000.0);
-	printf("  Total Exec:  %.6f sec \n",
-		allExec / 1000000000.0);
-   printf("  Total Read:  %.6f sec \n",
-	   allRead / 1000000000.0);
-    printf("\n=======================================\n");
-}
-
 
 void Conv2d(float* input, float* output, Network weight, Network bias)
 {
@@ -211,7 +123,6 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
     err = clSetKernelArg(CONV2D_KERNEL, 7, sizeof(cl_int), &embedDim);
     CHECK_ERROR(err);
 
-    // 커널 실행
     size_t global_size[3] = { embed_dim, output_size, output_size };
     size_t local_size[3] = { 1, 1, 1 };
 
@@ -219,26 +130,22 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
         global_size, local_size, 3, writeEvent, &execEvent);
     CHECK_ERROR(err);
 
-    // 결과 읽기
     err = clEnqueueReadBuffer(CONV2D_QUEUE, outputBuf, CL_FALSE, 0,
         sizeof(float) * embed_dim * output_size * output_size,
         output, 1, &execEvent, &readEvent);
     CHECK_ERROR(err);
     
     clFinish(CONV2D_QUEUE);
-
     profileEvents(writeEvent, 3, &CONV_WRITE_TIME);
     profileEvents(&execEvent, 1, &CONV_EXEC_TIME);
     profileEvents(&readEvent, 1, &CONV_READ_TIME);
     CONV_EXEC_COUNT += 1;
 
-    // 메모리 해제
     clReleaseMemObject(inputBuf);
     clReleaseMemObject(outputBuf);
     clReleaseMemObject(weightBuf);
     clReleaseMemObject(biasBuf);
 }
-
 
 void flatten_transpose(float *input, float *output)
 {
@@ -298,24 +205,24 @@ void layer_norm(float *input, float *output, Network weight, Network bias)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     //time_t startTime = clock();
-    //for (int t = 0; t < tokens; t++)
-    //{
-    //    float sum = 0.0, sum_sq = 0.0;
-    //    for (int i = 0; i < embed_dim; i++)
-    //    {
-    //        float val = input[t * embed_dim + i];
-    //        sum += val;
-    //        sum_sq += val * val;
-    //    }
-    //    float mean = sum / embed_dim;
-    //    float var = sum_sq / embed_dim - mean * mean;
-    //    float inv_std = 1.0f / sqrtf(var + eps);
-    //    for (int i = 0; i < embed_dim; i++)
-    //    {
-    //        int idx = t * embed_dim + i;
-    //        output[idx] = (input[idx] - mean) * inv_std * weight.data[i] + bias.data[i];
-    //    }
-    //}
+    /*for (int t = 0; t < tokens; t++)
+    {
+        float sum = 0.0, sum_sq = 0.0;
+        for (int i = 0; i < embed_dim; i++)
+        {
+            float val = input[t * embed_dim + i];
+            sum += val;
+            sum_sq += val * val;
+        }
+        float mean = sum / embed_dim;
+        float var = sum_sq / embed_dim - mean * mean;
+        float inv_std = 1.0f / sqrtf(var + eps);
+        for (int i = 0; i < embed_dim; i++)
+        {
+            int idx = t * embed_dim + i;
+            output[idx] = (input[idx] - mean) * inv_std * weight.data[i] + bias.data[i];
+        }
+    }*/
     cl_int err;
     cl_event writeEvent[3];
     cl_event execEvent;
@@ -388,7 +295,7 @@ void multihead_attn(float *input, float *output,
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     cl_int err;
-    cl_event writeEvent[3];
+    cl_event writeEvent[5];
     cl_event execEvent[3];
     cl_event readEvent;
 
@@ -438,7 +345,6 @@ void multihead_attn(float *input, float *output,
 		execEvent); 
     CHECK_ERROR(err);
     err = clReleaseMemObject(inputBuf);
-    profileEvents(writeEvent, 3, &QKV_WRITE_TIME);
 
     // --- 
     int print_tokens = tokens < 5 ? tokens : 5;
@@ -480,9 +386,9 @@ void multihead_attn(float *input, float *output,
     cl_mem outputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
 	CHECK_ERROR(err);
 
-    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim), out_weight.data, 1, execEvent + 1, writeEvent);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim), out_weight.data, 1, execEvent + 1, writeEvent + 3);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, execEvent + 1, writeEvent + 1);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, execEvent + 1, writeEvent + 4);
 	CHECK_ERROR(err);
     err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outputBuf);
 	CHECK_ERROR(err);
@@ -502,8 +408,13 @@ void multihead_attn(float *input, float *output,
     err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &doGelu);
 	CHECK_ERROR(err);
 
-    size_t global_LL_size[2] = {tokens, embed_dim};
-    size_t local_LL_size[2] = {1, 1};
+    int tileSize = 16;
+
+    size_t global_LL_size[] = {
+        ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
+        ((embed_dim+ tileSize - 1) / tileSize) * tileSize
+    };
+    size_t local_LL_size[] = { tileSize, tileSize };
 	err = clEnqueueNDRangeKernel(
 		MULTIHEAD_QUEUE, 
 		LL_KERNEL,
@@ -512,16 +423,18 @@ void multihead_attn(float *input, float *output,
 		global_LL_size, 
 		local_LL_size, 
 		2, 
-		writeEvent, execEvent + 2);
+		writeEvent + 3, execEvent + 2);
 	CHECK_ERROR(err); 
 
 	err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, execEvent + 2, &readEvent);
 	CHECK_ERROR(err);
 
+    //clWaitForEvents(1, &readEvent);
     clFinish(MULTIHEAD_QUEUE);
-    profileEvents(writeEvent, 2, &QKV_WRITE_TIME);
+    profileEvents(writeEvent, 3, &QKV_WRITE_TIME);
+    profileEvents(writeEvent + 3, 2, &QKV_WRITE_TIME);
     profileEvents(execEvent, 1, &QKV_EXEC_TIME);
-    profileEvents(execEvent + 1, 1, &QKV_EXEC_TIME);
+    profileEvents(execEvent + 1, 1, &QKV_TO_SCORE_EXEC_TIME);
     profileEvents(execEvent + 2, 1, &QKV_FINAL_LL_EXEC_TIME);
     profileEvents(&readEvent, 1, &QKV_READ_TIME);
 
@@ -585,16 +498,16 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     err = clSetKernelArg(LL_KERNEL, 5, sizeof(cl_int), &featureCount);
     CHECK_ERROR(err);
 
-    cl_int activateGelu;
-    if (doGelu) 
-        activateGelu = 1;
-    else 
-        activateGelu = 0;
+    cl_int activateGelu = doGelu ? 1 : 0;
     err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &activateGelu);
 	CHECK_ERROR(err); 
+    int tileSize = 16;
 
-	size_t global_size[] = {tokens, out_features};
-	size_t local_size[] = {1,1};
+	size_t global_size[] = {
+        ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
+        ((out_features + tileSize - 1) / tileSize) * tileSize
+    };
+    size_t local_size[] = {tileSize, tileSize};  // Must match TILE_SIZE
 	err = clEnqueueNDRangeKernel(
 		LL_QUEUE,
 		LL_KERNEL,
@@ -609,21 +522,20 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     
     err = clEnqueueReadBuffer(LL_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, &readEvent);
 	CHECK_ERROR(err); 
-    clFinish(LL_QUEUE);
+    clFinish(LL_QUEUE); 
 
-    err = clReleaseMemObject(outBuf);
+    profileEvents(writeEvent, 3, &LL_WRITE_TIME);
+    profileEvents(&execEvent, 1, &LL_EXEC_TIME);
+    profileEvents(&readEvent, 1, &LL_READ_TIME);
+    LL_EXEC_COUNT += 1;
+	err = clReleaseMemObject(outBuf);
 	CHECK_ERROR(err); 
     err = clReleaseMemObject(biasBuf);
 	CHECK_ERROR(err); 
     err = clReleaseMemObject(weightBuf);
 	CHECK_ERROR(err); 
     err = clReleaseMemObject(inputBuf);
-	CHECK_ERROR(err); 
-
-    profileEvents(writeEvent, 3, &LL_WRITE_TIME);
-    profileEvents(&execEvent, 1, &LL_EXEC_TIME);
-    profileEvents(&readEvent, 1, &LL_READ_TIME);
-    LL_EXEC_COUNT += 1;
+	CHECK_ERROR(err);
     //printf("ll : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
@@ -729,6 +641,7 @@ const int enc_size = embed_dim * ((img_size / patch_size) * (img_size / patch_si
 ////////////////////////////////////// Model Architecture //////////////////////////////////////
 void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 {  
+    time_t setupTime = clock();
     cl_int err;
     // Platform ID
     err = clGetPlatformIDs(1, &PLATFORM, NULL);
@@ -779,6 +692,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
 	cl_queue_properties props[] = {
 		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE,
+		//CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
 		0
 	};
 	MULTIHEAD_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
@@ -822,7 +736,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
 	LAYERNORM_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE,props, &err);
 	CHECK_ERROR(err);
-
+    printf("setup time: %.6f sec\n\n" , (double)(clock() - setupTime) / CLK_TCK);
+    //printSpec();
     for (int i = 0; i < image->n; i++)
     {
         double startTime = clock();
@@ -931,4 +846,271 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
     err = clReleaseContext(CONTEXT);
     CHECK_ERROR(err);
+}
+
+
+void printSpec() {
+    cl_uint num_platforms;
+    cl_platform_id *platforms;
+    cl_uint num_devices;
+    cl_device_id *devices;
+    char str[1024];
+    cl_device_type device_type;
+    size_t max_work_group_size;
+    cl_uint max_clock_frequency;
+    cl_ulong global_mem_size;
+    cl_ulong local_mem_size;
+    cl_ulong max_mem_alloc_size;
+    cl_ulong max_compute_units;
+    cl_command_queue_properties queue_properties;
+    cl_uint p, d;
+    cl_int err;
+
+    err = clGetPlatformIDs(0, NULL, &num_platforms);
+    CHECK_ERROR(err);
+
+    platforms = (cl_platform_id *)malloc(sizeof(cl_platform_id) * num_platforms);
+    err = clGetPlatformIDs(num_platforms, platforms, NULL);
+    CHECK_ERROR(err);
+
+    printf("Number of platforms: %u\n\n", num_platforms);
+    for (p = 0; p < num_platforms; p++)
+    {
+        printf("platform: %u\n", p);
+
+        err = clGetPlatformInfo(platforms[p], CL_PLATFORM_NAME, 1024, str, NULL);
+        CHECK_ERROR(err);
+        printf("- CL_PLATFORM_NAME\t:%s\n", str);
+
+        err = clGetPlatformInfo(platforms[p], CL_PLATFORM_VENDOR, 1024, str, NULL);
+        CHECK_ERROR(err);
+        printf("- CL_PLATFORM_VENDOR\t:%s\n\n", str);
+
+        err = clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, 0, NULL, &num_devices);
+        CHECK_ERROR(err);
+        printf("Number of devices:\t%u\n\n", num_devices);
+
+        devices = (cl_device_id *)malloc(sizeof(cl_device_id) * num_devices);
+        err = clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, num_devices, devices, NULL);
+        CHECK_ERROR(err);
+
+        for (d = 0; d < num_devices; d++)
+        {
+            printf("device: %u\n", d);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_TYPE, sizeof(cl_device_type), &device_type, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_TYPE\t:");
+            if (device_type & CL_DEVICE_TYPE_CPU)
+                printf(" CL_DEVICE_TYPE_CPU");
+            if (device_type & CL_DEVICE_TYPE_GPU)
+                printf(" CL_DEVICE_TYPE_GPU");
+            if (device_type & CL_DEVICE_TYPE_ACCELERATOR)
+                printf(" CL_DEVICE_TYPE_ACCELERATOR");
+            if (device_type & CL_DEVICE_TYPE_DEFAULT)
+                printf(" CL_DEVICE_TYPE_DEFAULT");
+            if (device_type & CL_DEVICE_TYPE_CUSTOM)
+                printf(" CL_DEVICE_TYPE_CUSTOM");
+            printf("\n");
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_NAME, 1024, str, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_NAME\t: %s\n", str);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_VENDOR, 1024, str, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_VENDOR\t: %s\n", str);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_VERSION, 1024, str, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_VERSION\t: %s\n", str);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(cl_ulong), &max_clock_frequency, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_MAX_CLOCK_FREQUENCY : %luMHz\n", max_clock_frequency);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_ulong), &max_compute_units, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_MAX_COMPUTE_UNITS : %lu\n", max_compute_units);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &max_work_group_size, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_MAX_WORK_GROUP_SIZE : %lu\n", max_work_group_size);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem_size, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_GLOBAL_MEM_SIZE : %lu\n", global_mem_size);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &local_mem_size, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_LOCAL_MEM_SIZE : %lu\n", local_mem_size);
+
+            err = clGetDeviceInfo(devices[d], CL_DEVICE_QUEUE_PROPERTIES, sizeof(cl_ulong), &queue_properties, NULL);
+            CHECK_ERROR(err);
+            printf("- CL_DEVICE_QUEUE_PROPERTIES :");
+            if (queue_properties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE)
+                printf(" CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE");
+            if (queue_properties & CL_QUEUE_PROFILING_ENABLE)
+                printf(" CL_QUEUE_PROFILING_ENABLE");
+            printf("\n");
+        }
+
+        free(devices);
+    }
+
+    free(platforms);
+    return 0;
+}
+
+void profileEvents(cl_event *events, int eventCount, cl_ulong* timeGlobalVariable) { 
+    cl_ulong start, end, minStart = ULLONG_MAX, maxEnd = 0;
+    for (int i = 0; i < eventCount; i++) {
+        clGetEventProfilingInfo(events[i], CL_PROFILING_COMMAND_START,
+                               sizeof(cl_ulong), &start, NULL);
+        clGetEventProfilingInfo(events[i], CL_PROFILING_COMMAND_END, 
+                               sizeof(cl_ulong), &end, NULL);
+        if (start < minStart) minStart= start;
+        if (end > maxEnd) maxEnd= end;
+    }
+    cl_ulong total = (maxEnd- minStart);
+
+    *timeGlobalVariable += total;
+}
+
+void printEventProfile() {
+    printf("\n========== PROFILING RESULTS ==========\n");
+    
+    if (LAYERNORM_EXEC_COUNT > 0) {
+        printf("\nLayerNorm (%d executions):\n", LAYERNORM_EXEC_COUNT);
+        printf("  Write: %.6f sec (avg: %.6f sec)\n",
+               LAYERNORM_WRITE_TIME / 1000000000.0,
+               LAYERNORM_WRITE_TIME / 1000000000.0 / LAYERNORM_EXEC_COUNT);
+        printf("  Exec:  %.6f sec (avg: %.6f sec)\n",
+               LAYERNORM_EXEC_TIME / 1000000000.0,
+               LAYERNORM_EXEC_TIME / 1000000000.0 / LAYERNORM_EXEC_COUNT);
+        printf("  Read:  %.6f sec (avg: %.6f sec)\n",
+               LAYERNORM_READ_TIME / 1000000000.0,
+               LAYERNORM_READ_TIME / 1000000000.0 / LAYERNORM_EXEC_COUNT);
+        printf("  Total: %.6f sec (avg: %.6f sec)\n",
+               (LAYERNORM_WRITE_TIME + LAYERNORM_EXEC_TIME + LAYERNORM_READ_TIME) / 1000000000.0,
+               (LAYERNORM_WRITE_TIME + LAYERNORM_EXEC_TIME + LAYERNORM_READ_TIME) / 1000000000.0 / LAYERNORM_EXEC_COUNT);
+    }
+    
+    if (QKV_EXEC_COUNT> 0) {
+        printf("\nMultiHeadAttention (%d executions):\n", QKV_EXEC_COUNT);
+        printf("  Write: %.6f sec (avg: %.6f sec)\n",
+               QKV_WRITE_TIME / 1000000000.0,
+               QKV_WRITE_TIME / 1000000000.0 / QKV_EXEC_COUNT);
+        printf("  Exec(QKV):  %.6f sec (avg: %.6f sec)\n",
+               QKV_EXEC_TIME / 1000000000.0,
+               QKV_EXEC_TIME / 1000000000.0 / QKV_EXEC_COUNT);
+        printf("  Exec(QKV_TO_SCOREV):  %.6f sec (avg: %.6f sec)\n",
+			   QKV_TO_SCORE_EXEC_TIME / 1000000000.0,
+			   QKV_TO_SCORE_EXEC_TIME / 1000000000.0 / QKV_EXEC_COUNT);
+        printf("  Exec(final LL):  %.6f sec (avg: %.6f sec)\n",
+			   QKV_FINAL_LL_EXEC_TIME / 1000000000.0,
+			   QKV_FINAL_LL_EXEC_TIME / 1000000000.0 / QKV_EXEC_COUNT);
+        printf("  Read:  %.6f sec (avg: %.6f sec)\n",
+               QKV_READ_TIME / 1000000000.0,
+               QKV_READ_TIME / 1000000000.0 / QKV_EXEC_COUNT);
+    }
+    
+    if (LL_EXEC_COUNT > 0) {
+        printf("\nLL (%d executions):\n", LL_EXEC_COUNT);
+        printf("  Write: %.6f sec (avg: %.6f sec)\n",
+               LL_WRITE_TIME / 1000000000.0,
+               LL_WRITE_TIME / 1000000000.0 / LL_EXEC_COUNT);
+        printf("  Exec:  %.6f sec (avg: %.6f sec)\n",
+               LL_EXEC_TIME / 1000000000.0,
+               LL_EXEC_TIME / 1000000000.0 / LL_EXEC_COUNT);
+        printf("  Read:  %.6f sec (avg: %.6f sec)\n",
+               LL_READ_TIME / 1000000000.0,
+               LL_READ_TIME / 1000000000.0 / LL_EXEC_COUNT);
+    }
+
+	if (CONV_EXEC_COUNT> 0) {
+		printf("\nCONV (%d executions):\n", CONV_EXEC_COUNT);
+		printf("  Write: %.6f sec (avg: %.6f sec)\n",
+			   CONV_WRITE_TIME / 1000000000.0,
+			   CONV_WRITE_TIME / 1000000000.0 / CONV_EXEC_COUNT);
+		printf("  Exec:  %.6f sec (avg: %.6f sec)\n",
+			   CONV_EXEC_TIME / 1000000000.0,
+			   CONV_EXEC_TIME / 1000000000.0 / CONV_EXEC_COUNT);
+		printf("  Read:  %.6f sec (avg: %.6f sec)\n",
+			   CONV_READ_TIME / 1000000000.0,
+			   CONV_READ_TIME / 1000000000.0 / CONV_EXEC_COUNT);
+	}
+    cl_ulong allwrite= CONV_WRITE_TIME + LL_WRITE_TIME+ QKV_WRITE_TIME + LAYERNORM_WRITE_TIME;
+    cl_ulong allExec= CONV_EXEC_TIME + LL_EXEC_TIME + LAYERNORM_EXEC_TIME + QKV_EXEC_TIME + QKV_TO_SCORE_EXEC_TIME + QKV_FINAL_LL_EXEC_TIME;
+    cl_ulong allRead = CONV_READ_TIME + LL_READ_TIME+ QKV_READ_TIME + LAYERNORM_READ_TIME;
+
+    printf("\nTotal Execution Time By Jobs:\n");
+    printf("  Total write:  %.6f sec \n",
+        allwrite / 1000000000.0);
+	printf("  Total Exec:  %.6f sec \n",
+		allExec / 1000000000.0);
+   printf("  Total Read:  %.6f sec \n",
+	   allRead / 1000000000.0);
+
+
+    cl_ulong grandTotal = allwrite + allExec + allRead;
+
+    if (grandTotal == 0) {
+        printf("\nNo profiling data available for total ratio breakdown.\n");
+    }
+    else {
+        double totalSec = grandTotal / 1000000000.0;
+
+        printf("\nOverall Totals:\n");
+        printf("  Grand Total Time: %.6f sec\n", totalSec);
+
+        double write_ratio = (double)allwrite / (double)grandTotal * 100.0;
+        double exec_ratio = (double)allExec / (double)grandTotal * 100.0;
+        double read_ratio = (double)allRead / (double)grandTotal * 100.0;
+
+        printf("  Write portion: %.2f%%\n", write_ratio);
+        printf("  Exec portion:  %.2f%%\n", exec_ratio);
+        printf("  Read portion:  %.2f%%\n", read_ratio);
+
+        printf("\nBreakdown by job type (percentage of total):\n");
+
+        // LayerNorm
+        if (LAYERNORM_EXEC_COUNT > 0) {
+            double w = LAYERNORM_WRITE_TIME / (double)grandTotal * 100.0;
+            double e = LAYERNORM_EXEC_TIME / (double)grandTotal * 100.0;
+            double r = LAYERNORM_READ_TIME / (double)grandTotal * 100.0;
+            printf("  LayerNorm: write %.2f%%, exec %.2f%%, read %.2f%% (sum %.2f%%)\n",
+                w, e, r, w + e + r);
+        }
+
+        // QKV (MultiHeadAttention)
+        if (QKV_EXEC_COUNT > 0) {
+            double w = QKV_WRITE_TIME / (double)grandTotal * 100.0;
+            double e1 = QKV_EXEC_TIME / (double)grandTotal * 100.0;
+            double e2 = QKV_TO_SCORE_EXEC_TIME / (double)grandTotal * 100.0;
+            double e3 = QKV_FINAL_LL_EXEC_TIME / (double)grandTotal * 100.0;
+            double r = QKV_READ_TIME / (double)grandTotal * 100.0;
+            printf("  MultiHeadAttention: write %.2f%%, exec %.2f%% + %.2f%% + %.2f%%, read %.2f%% (sum %.2f%%)\n",
+                w, e1, e2, e3, r, w + e1 + e2 + e3 + r);
+        }
+
+        // LL
+        if (LL_EXEC_COUNT > 0) {
+            double w = LL_WRITE_TIME / (double)grandTotal * 100.0;
+            double e = LL_EXEC_TIME / (double)grandTotal * 100.0;
+            double r = LL_READ_TIME / (double)grandTotal * 100.0;
+            printf("  LL: write %.2f%%, exec %.2f%%, read %.2f%% (sum %.2f%%)\n",
+                w, e, r, w + e + r);
+        }
+
+        // CONV
+        if (CONV_EXEC_COUNT > 0) {
+            double w = CONV_WRITE_TIME / (double)grandTotal * 100.0;
+            double e = CONV_EXEC_TIME / (double)grandTotal * 100.0;
+            double r = CONV_READ_TIME / (double)grandTotal * 100.0;
+            printf("  CONV: write %.2f%%, exec %.2f%%, read %.2f%% (sum %.2f%%)\n",
+                w, e, r, w + e + r);
+        }
+    }
+    printf("\n=======================================\n");
 }
