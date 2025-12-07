@@ -41,41 +41,11 @@ cl_command_queue LL_QUEUE;
 cl_program CONV2D_PROGRAM;
 cl_kernel CONV2D_KERNEL;
 cl_command_queue CONV2D_QUEUE;
-////////////////////////////////////// ViT function //////////////////////////////////////
 
-//void Conv2d(float *input, float *output, Network weight, Network bias)
-//{
-//    int output_size = img_size / patch_size;
-//
-//    for (int oc = 0; oc < embed_dim; ++oc)
-//    {
-//        for (int oh = 0; oh < output_size; ++oh)
-//        {
-//            for (int ow = 0; ow < output_size; ++ow)
-//            {
-//                float sum = bias.data[oc];
-//
-//                for (int ic = 0; ic < in_chans; ++ic)
-//                {
-//                    for (int kh = 0; kh < patch_size; ++kh)
-//                    {
-//                        for (int kw = 0; kw < patch_size; ++kw)
-//                        {
-//                            int ih = oh * patch_size + kh;
-//                            int iw = ow * patch_size + kw;
-//                            int input_idx = (ic * img_size + ih) * img_size + iw;
-//                            int kernel_idx = ((oc * in_chans + ic) * patch_size + kh) * patch_size + kw;
-//
-//                            sum += input[input_idx] * weight.data[kernel_idx];
-//                        }
-//                    }
-//                }
-//
-//                output[(oc * output_size + oh) * output_size + ow] = sum;
-//            }
-//        }
-//    }
-//}
+cl_program LAYERNORM_PROGRAM;
+cl_kernel LAYERNORM_KERNEL;
+cl_command_queue LAYERNORM_QUEUE;
+////////////////////////////////////// ViT function //////////////////////////////////////
 
 void Conv2d(float* input, float* output, Network weight, Network bias)
 {
@@ -212,26 +182,81 @@ void pos_emb(float *input, float *output, Network pos_emb)
 
 void layer_norm(float *input, float *output, Network weight, Network bias)
 {
-    int token = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-
-    for (int t = 0; t < token; t++)
-    {
-        float sum = 0.0, sum_sq = 0.0;
-        for (int i = 0; i < embed_dim; i++)
-        {
-            float val = input[t * embed_dim + i];
-            sum += val;
-            sum_sq += val * val;
-        }
-        float mean = sum / embed_dim;
-        float var = sum_sq / embed_dim - mean * mean;
-        float inv_std = 1.0f / sqrtf(var + eps);
-        for (int i = 0; i < embed_dim; i++)
-        {
-            int idx = t * embed_dim + i;
-            output[idx] = (input[idx] - mean) * inv_std * weight.data[i] + bias.data[i];
-        }
-    }
+    int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
+    time_t startTime = clock();
+    //for (int t = 0; t < tokens; t++)
+    //{
+    //    float sum = 0.0, sum_sq = 0.0;
+    //    for (int i = 0; i < embed_dim; i++)
+    //    {
+    //        float val = input[t * embed_dim + i];
+    //        sum += val;
+    //        sum_sq += val * val;
+    //    }
+    //    float mean = sum / embed_dim;
+    //    float var = sum_sq / embed_dim - mean * mean;
+    //    float inv_std = 1.0f / sqrtf(var + eps);
+    //    for (int i = 0; i < embed_dim; i++)
+    //    {
+    //        int idx = t * embed_dim + i;
+    //        output[idx] = (input[idx] - mean) * inv_std * weight.data[i] + bias.data[i];
+    //    }
+    //}
+    cl_int err;
+    cl_event writeEvent[3];
+    cl_event execEvent;
+    cl_mem inputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
+	CHECK_ERROR(err);
+	cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+	CHECK_ERROR(err);
+	cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+	CHECK_ERROR(err);
+    cl_mem outputbuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
+	CHECK_ERROR(err);
+    
+	err = clEnqueueWriteBuffer(LAYERNORM_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+	CHECK_ERROR(err);
+	err = clEnqueueWriteBuffer(LAYERNORM_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * embed_dim, weight.data , 0, NULL, writeEvent + 1);
+	CHECK_ERROR(err);
+	err = clEnqueueWriteBuffer(LAYERNORM_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * embed_dim, bias.data, 0, NULL, writeEvent + 2);
+	CHECK_ERROR(err);
+    
+    err = clSetKernelArg(LAYERNORM_KERNEL, 0, sizeof(cl_mem), &inputBuf);
+	CHECK_ERROR(err);
+    err = clSetKernelArg(LAYERNORM_KERNEL, 1, sizeof(cl_mem), &weightBuf);
+	CHECK_ERROR(err);
+	err = clSetKernelArg(LAYERNORM_KERNEL, 2, sizeof(cl_mem), &biasBuf);
+	CHECK_ERROR(err);
+	err = clSetKernelArg(LAYERNORM_KERNEL, 3, sizeof(cl_mem), &outputbuf);
+	CHECK_ERROR(err);
+	cl_int clTokens = tokens;
+	err = clSetKernelArg(LAYERNORM_KERNEL, 4, sizeof(cl_int), &clTokens);
+	CHECK_ERROR(err);
+	cl_int clEmbedDim= embed_dim;
+	err = clSetKernelArg(LAYERNORM_KERNEL, 5, sizeof(cl_int), &clEmbedDim);
+	CHECK_ERROR(err);
+	
+    size_t globalSize[2] = {tokens, embed_dim};
+    size_t localSize[2] = {1, 256};
+    err = clEnqueueNDRangeKernel(
+		LAYERNORM_QUEUE,
+		LAYERNORM_KERNEL,
+		2,
+		NULL,
+		globalSize,
+		localSize,
+		3,
+		writeEvent,
+		&execEvent);
+	CHECK_ERROR(err);
+    err = clEnqueueReadBuffer(LAYERNORM_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, NULL);
+    CHECK_ERROR(err);
+    clFinish(LAYERNORM_QUEUE);
+    clReleaseMemObject(inputBuf);
+    clReleaseMemObject(weightBuf);
+    clReleaseMemObject(biasBuf);
+    clReleaseMemObject(outputbuf);
+    printf("Layer Normalization: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
 void multihead_attn(float *input, float *output,
@@ -242,30 +267,6 @@ void multihead_attn(float *input, float *output,
     //printf("tokens :%d embed_dim:%d in_weight:%d in_bais:%d out_weight:%d out_bias:%d\n", tokens, embed_dim, in_weight.size, in_bias.size, out_weight.size,out_weight.size);
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
-    float *Q = (float *)malloc(sizeof(float) * tokens * embed_dim);
-    if (Q == NULL) printf("malloc failed in line %d\n", __LINE__);
-    float *K = (float *)malloc(sizeof(float) * tokens * embed_dim);
-    if (K == NULL) printf("malloc failed in line %d\n", __LINE__);
-    float *V = (float *)malloc(sizeof(float) * tokens * embed_dim);
-    if (V == NULL) printf("malloc failed in line %d\n", __LINE__);
-    ///*Q, K, V 구하기*/
-    //for (int t = 0; t < tokens; t++)
-    //{
-    //    float sum_q, sum_k, sum_v;
-    //    for (int i = 0; i < embed_dim; i++)
-    //    {
-    //        sum_q = in_bias.data[Q_dim + i], sum_k = in_bias.data[K_dim + i], sum_v = in_bias.data[V_dim + i];
-    //        for (int j = 0; j < embed_dim; j++)
-    //        {
-    //            sum_q += input[t * embed_dim + j] * in_weight.data[(Q_dim + i) * embed_dim + j];
-    //            sum_k += input[t * embed_dim + j] * in_weight.data[(K_dim + i) * embed_dim + j];
-    //            sum_v += input[t * embed_dim + j] * in_weight.data[(V_dim + i) * embed_dim + j];
-    //        }
-    //        Q[t * embed_dim + i] = sum_q;
-    //        K[t * embed_dim + i] = sum_k;
-    //        V[t * embed_dim + i] = sum_v;
-    //    }
-    //}	
     cl_int err;
     cl_event writeEvent[3];
     cl_event execEvent;
@@ -354,22 +355,9 @@ void multihead_attn(float *input, float *output,
         NULL, NULL);
     CHECK_ERROR(err);
     clFinish(MULTIHEAD_QUEUE);
-    printf("QKV_TO_SCOREV: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("QKV_TO_SCOREV: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
     // 최종 선형 프로젝션
     startTime = clock();
-    /*for (int t = 0; t < tokens; t++)
-    {
-        for (int i = 0; i < embed_dim; i++)
-        {
-            float sum = out_bias.data[i];
-            for (int j = 0; j < embed_dim; j++)
-            {
-                sum += attn_output[t * embed_dim + j] * out_weight.data[i * embed_dim + j];
-            }
-            output[t * embed_dim + i] = sum;
-        }
-    }*/
-
     cl_mem outputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
 	CHECK_ERROR(err);
 
@@ -413,8 +401,9 @@ void multihead_attn(float *input, float *output,
     err = clReleaseMemObject(weightBuf);
     err = clReleaseMemObject(biasBuf);
     clReleaseMemObject(attnBuf);
+    clReleaseMemObject(qkvBuf);
     free(attn_output);
-    printf("not parallelized part: %.4f sec\n\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("final linear projection: %.6f sec\n\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
 //float gelu(float x)
@@ -431,7 +420,6 @@ void multihead_attn(float *input, float *output,
 
 void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, Network weight, Network bias, bool doGelu) {
     cl_int err;
-    printf("tokens:%d in_features:%d out_features%d weight:%d bias:%d\n", tokens, in_features, out_features, weight.size, bias.size);
 	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
     cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (in_features * out_features ), NULL, &err);
@@ -511,11 +499,11 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
     
     clock_t startTime = clock();
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
-    printf("ll #1: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("ll #1: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 
     startTime = clock();
     linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
-    printf("ll #2: %.4f sec\n", (double)(clock() - startTime) / CLK_TCK);
+    printf("ll #2: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
     free(fc1_out);
 }
 
@@ -656,7 +644,9 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     CHECK_ERROR(err);
 
 	cl_queue_properties props[] = {
-		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+		CL_QUEUE_PROPERTIES, 
+        CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+        CL_QUEUE_PROFILING_ENABLE,
 		0
 	};
 	MULTIHEAD_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
@@ -685,7 +675,21 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     build_error(CONV2D_PROGRAM, DEVICE, err);
     CHECK_ERROR(err);
     CONV2D_KERNEL = clCreateKernel(CONV2D_PROGRAM, "conv2d_kernel", &err);
+	CHECK_ERROR(err);
     CONV2D_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, 0, &err);
+	CHECK_ERROR(err);
+    
+    // for layer_norm 
+	kernel_source = get_source_code("layer_norm.cl", &kernel_source_size);
+	LAYERNORM_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
+	CHECK_ERROR(err);
+	CHECK_ERROR(clBuildProgram(LAYERNORM_PROGRAM, 1, &DEVICE, "", NULL, NULL));
+	build_error(CONV2D_PROGRAM, DEVICE, err);
+	CHECK_ERROR(err);
+	LAYERNORM_KERNEL= clCreateKernel(LAYERNORM_PROGRAM, "layerNorm", &err);
+	CHECK_ERROR(err);
+	LAYERNORM_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE,props, &err);
+	CHECK_ERROR(err);
 
     for (int i = 0; i < image->n; i++)
     {
@@ -698,7 +702,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         class_token(layer[1], layer[2], networks[0]);
         /*position embedding*/
         pos_emb(layer[2], layer[3], networks[3]); 
-
+        printf("pre-processing : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 
         /*Encoder - 12 Layers*/
         Encoder(layer[3], enc_layer[0],
@@ -772,22 +776,25 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
         linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151], false);
         /* 확률분포 추출 */
+        time_t softmaxTime = clock();
         Softmax(cls_output, probabilities[i], num_classes);
-        printf("picture #%d: %.4f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
-
-        
+        printf("softmax: %.6f sec\n\n", i, (double)(clock() - softmaxTime) / CLK_TCK);
+        printf("picture #%d: %.6f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
     }
 
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_TO_SCOREV_KERNEL));
     CHECK_ERROR(clReleaseKernel(CONV2D_KERNEL));
+    CHECK_ERROR(clReleaseKernel(LAYERNORM_KERNEL));
 	CHECK_ERROR(clReleaseProgram(MULTIHEAD_PROGRAM));
     CHECK_ERROR(clReleaseProgram(LL_PROGRAM));
     CHECK_ERROR(clReleaseProgram(CONV2D_PROGRAM));
+    CHECK_ERROR(clReleaseProgram(LAYERNORM_PROGRAM));
 	CHECK_ERROR(clReleaseCommandQueue(MULTIHEAD_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(LL_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(CONV2D_QUEUE));
+    CHECK_ERROR(clReleaseCommandQueue(LAYERNORM_QUEUE));
 
     err = clReleaseContext(CONTEXT);
     CHECK_ERROR(err);

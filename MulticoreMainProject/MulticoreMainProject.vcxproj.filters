@@ -64,8 +64,6 @@
     <None Include="conv2d.cl">
       <Filter>Source Files\kernels</Filter>
     </None>
-    <None Include="scaledDotSoftmax.cl">
-      <Filter>Source Files\kernels</Filter>
-    </None>
+    <None Include="layer_norm.cl" />
   </ItemGroup>
 </Project>
