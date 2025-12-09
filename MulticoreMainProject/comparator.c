@@ -28,8 +28,8 @@ int comparator(void)
     FILE *fp_result = NULL;
     FILE *fp_answer = NULL;
     errno_t err1 = fopen_s(&fp_result, "./Data/opencl_result.txt", "r");
-    //errno_t err2 = fopen_s(&fp_answer, "./Data/answer_result.txt", "r");
-    errno_t err2 = fopen_s(&fp_answer, "./Data/answer_result_1.txt", "r");
+    errno_t err2 = fopen_s(&fp_answer, "./Data/answer_result.txt", "r");
+    //errno_t err2 = fopen_s(&fp_answer, "./Data/answer_result_1.txt", "r");
 
     if (err1 != 0 || fp_result == NULL)
     {

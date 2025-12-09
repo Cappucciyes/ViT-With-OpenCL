@@ -23,6 +23,21 @@
 #define drop_path_rate 0.0
 #define eps 1e-6
 
+typedef struct {
+    cl_mem ln1_w, ln1_b;
+    cl_mem attn_w, attn_b;
+    cl_mem attn_out_w, attn_out_b;
+    cl_mem ln2_w, ln2_b;
+    cl_mem mlp1_w, mlp1_b;
+    cl_mem mlp2_w, mlp2_b;
+} EncoderWeights;
+
+typedef struct {
+    cl_mem ln_w, ln_b;
+    cl_mem mlp_w, mlp_b;
+} FinalWeight;
+
+
 // Global Variable
 cl_platform_id PLATFORM;
 cl_device_id DEVICE;
@@ -35,19 +50,15 @@ cl_command_queue READ_COMMAND_QUEUE;
 cl_program MULTIHEAD_PROGRAM;
 cl_kernel QKV_KERNEL;
 cl_kernel QKV_TO_SCOREV_KERNEL;
-cl_command_queue MULTIHEAD_QUEUE;
 
 cl_program LL_PROGRAM;
 cl_kernel LL_KERNEL;
-cl_command_queue LL_QUEUE;
 
 cl_program CONV2D_PROGRAM;
 cl_kernel CONV2D_KERNEL;
-cl_command_queue CONV2D_QUEUE;
 
 cl_program LAYERNORM_PROGRAM;
 cl_kernel LAYERNORM_KERNEL;
-cl_command_queue LAYERNORM_QUEUE;
 
 cl_ulong CONV_WRITE_TIME;
 cl_ulong CONV_EXEC_TIME;
@@ -75,12 +86,16 @@ int encoderCount;
 ////////////////////////////////////// utils function //////////////////////////////////////
 void printSpec();
 void profileEvents(cl_event* events, int eventCount, cl_ulong* timeGlobalVariable);
+EncoderWeights initEncoderWeight();
+void fillEncoderWeight(EncoderWeights weights, Network* networkList, int encoderIndex);
+FinalWeight initFinalWeight(Network* networkList);
+void fillFinalWeight(FinalWeight weights, Network* networkList);
 
 // testing 
 void printEventProfile();
-void test_linear_layer();
+//void test_linear_layer();
 bool findNaN(float* a, int tokens, int embedings);
-void test_linear_layer_big();
+//void test_linear_layer_big();
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
 void Conv2d(float* input, float* output, Network weight, Network bias)
@@ -95,16 +110,16 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
     CHECK_ERROR(err);
     cl_mem outputBuf = clCreateBuffer(CONTEXT, CL_MEM_WRITE_ONLY, sizeof(float) * embed_dim * output_size * output_size, NULL, &err);
     CHECK_ERROR(err);
-    cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY, sizeof(float) * weight.size, NULL, &err);
+    cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY, sizeof(float) * embed_dim * embed_dim, NULL, &err);
     CHECK_ERROR(err);
-    cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY, sizeof(float) * bias.size, NULL, &err);
+    cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY, sizeof(float) * embed_dim, NULL, &err);
     CHECK_ERROR(err);
 
-    err = clEnqueueWriteBuffer(CONV2D_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * img_size * img_size * in_chans, input, 0, NULL, writeEvent);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * img_size * img_size * in_chans, input, 0, NULL, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(CONV2D_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * weight.size, weight.data, 0, NULL, writeEvent + 1);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * embed_dim * embed_dim, weight.data, 0, NULL, writeEvent + 1);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(CONV2D_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * bias.size, bias.data, 0, NULL, writeEvent + 2);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * embed_dim, bias.data, 0, NULL, writeEvent + 2);
     CHECK_ERROR(err);
 
     err = clSetKernelArg(CONV2D_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -131,16 +146,16 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
     size_t global_size[3] = { embed_dim, output_size, output_size };
     size_t local_size[3] = { 1, 1, 1 };
 
-    err = clEnqueueNDRangeKernel(CONV2D_QUEUE, CONV2D_KERNEL, 3, NULL,
+    err = clEnqueueNDRangeKernel(EXEC_COMMAND_QUEUE, CONV2D_KERNEL, 3, NULL,
         global_size, local_size, 3, writeEvent, &execEvent);
     CHECK_ERROR(err);
 
-    err = clEnqueueReadBuffer(CONV2D_QUEUE, outputBuf, CL_FALSE, 0,
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0,
         sizeof(float) * embed_dim * output_size * output_size,
         output, 1, &execEvent, &readEvent);
     CHECK_ERROR(err);
     
-    clFinish(CONV2D_QUEUE);
+    clFinish(READ_COMMAND_QUEUE);
     profileEvents(writeEvent, 3, &CONV_WRITE_TIME);
     profileEvents(&execEvent, 1, &CONV_EXEC_TIME);
     profileEvents(&readEvent, 1, &CONV_READ_TIME);
@@ -206,34 +221,26 @@ void pos_emb(float *input, float *output, Network pos_emb)
     }
 }
 
-void layer_norm(float *input, float *output, Network weight, Network bias)
+void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     cl_int err;
-    cl_event writeEvent[3];
+    cl_event writeEvent[1];
     cl_event execEvent;
     cl_event readEvent;
     cl_mem inputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
-	cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-	CHECK_ERROR(err);
-	cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-	CHECK_ERROR(err);
     cl_mem outputbuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
     
-	err = clEnqueueWriteBuffer(LAYERNORM_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
-	CHECK_ERROR(err);
-	err = clEnqueueWriteBuffer(LAYERNORM_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * embed_dim, weight.data , 0, NULL, writeEvent + 1);
-	CHECK_ERROR(err);
-	err = clEnqueueWriteBuffer(LAYERNORM_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * embed_dim, bias.data, 0, NULL, writeEvent + 2);
+	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
 	CHECK_ERROR(err);
     
     err = clSetKernelArg(LAYERNORM_KERNEL, 0, sizeof(cl_mem), &inputBuf);
 	CHECK_ERROR(err);
-    err = clSetKernelArg(LAYERNORM_KERNEL, 1, sizeof(cl_mem), &weightBuf);
+    err = clSetKernelArg(LAYERNORM_KERNEL, 1, sizeof(cl_mem), &weight);
 	CHECK_ERROR(err);
-	err = clSetKernelArg(LAYERNORM_KERNEL, 2, sizeof(cl_mem), &biasBuf);
+	err = clSetKernelArg(LAYERNORM_KERNEL, 2, sizeof(cl_mem), &bias);
 	CHECK_ERROR(err);
 	err = clSetKernelArg(LAYERNORM_KERNEL, 3, sizeof(cl_mem), &outputbuf);
 	CHECK_ERROR(err);
@@ -247,35 +254,33 @@ void layer_norm(float *input, float *output, Network weight, Network bias)
     size_t globalSize[2] = {tokens, embed_dim};
     size_t localSize[2] = {1, 256};
     err = clEnqueueNDRangeKernel(
-		LAYERNORM_QUEUE,
+		EXEC_COMMAND_QUEUE,
 		LAYERNORM_KERNEL,
 		2,
 		NULL,
 		globalSize,
 		localSize,
-		3,
+		1,
 		writeEvent,
 		&execEvent);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(LAYERNORM_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, &readEvent);
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, &readEvent);
     CHECK_ERROR(err);
-    clFinish(LAYERNORM_QUEUE);
+    clFinish(READ_COMMAND_QUEUE);
 
-    profileEvents(writeEvent, 3, &LAYERNORM_WRITE_TIME);
+    profileEvents(writeEvent, 1, &LAYERNORM_WRITE_TIME);
 	profileEvents(&execEvent, 1, &LAYERNORM_EXEC_TIME);
 	profileEvents(&readEvent, 1, &LAYERNORM_READ_TIME);
 	LAYERNORM_EXEC_COUNT += 1;
 
     clReleaseMemObject(inputBuf);
-    clReleaseMemObject(weightBuf);
-    clReleaseMemObject(biasBuf);
     clReleaseMemObject(outputbuf);
     //printf("Layer Normalization: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 
 }
 
 void multihead_attn(float *input, float *output,
-                    Network in_weight, Network in_bias, Network out_weight, Network out_bias)
+                    cl_mem in_weight, cl_mem in_bias, cl_mem out_weight, cl_mem out_bias)
 {
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     /*Allocate Q, K, V : tokens * dim*/
@@ -290,25 +295,17 @@ void multihead_attn(float *input, float *output,
 	CHECK_ERROR(err);
     cl_mem qkvBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim * 3), NULL, &err);
 	CHECK_ERROR(err);
-	cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (embed_dim* embed_dim* 3), NULL, &err);
-	CHECK_ERROR(err);
-	cl_mem biasBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (embed_dim * 3), NULL, &err);
-	CHECK_ERROR(err);
     
     err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, &writeEvent[1]);
-	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * 3), in_bias.data, 0, NULL, &writeEvent[2]);
-	CHECK_ERROR(err);
 
    	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
 	CHECK_ERROR(err);
-    err = clSetKernelArg(QKV_KERNEL, 1, sizeof(cl_mem), &weightBuf);
+    err = clSetKernelArg(QKV_KERNEL, 1, sizeof(cl_mem), &in_weight);
     CHECK_ERROR(err);
     err = clSetKernelArg(QKV_KERNEL, 2, sizeof(cl_mem), &qkvBuf);
     CHECK_ERROR(err);
-    err = clSetKernelArg(QKV_KERNEL, 3, sizeof(cl_mem), &biasBuf);
+    err = clSetKernelArg(QKV_KERNEL, 3, sizeof(cl_mem), &in_bias);
     CHECK_ERROR(err);
     cl_int rowSize= tokens;
     err = clSetKernelArg(QKV_KERNEL, 4, sizeof(cl_int), &rowSize);
@@ -337,7 +334,7 @@ void multihead_attn(float *input, float *output,
 		NULL,
 		global_size,
 		local_size,
-		3,
+		1,
 		writeEvent,
 		execEvent); 
     CHECK_ERROR(err);
@@ -401,23 +398,14 @@ void multihead_attn(float *input, float *output,
     // 최종 선형 프로젝션
     cl_mem outputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
 	CHECK_ERROR(err);
-    cl_mem outWeightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    cl_mem outBiasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, outWeightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * embed_dim), out_weight.data, 1, &execEvent[1], &writeEvent[3]);
-	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, outBiasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, &execEvent[1], &writeEvent[4]);
-	CHECK_ERROR(err);
 
     err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outputBuf);
 	CHECK_ERROR(err);
-	err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &outWeightBuf);
+	err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &out_weight);
 	CHECK_ERROR(err);
 	err = clSetKernelArg(LL_KERNEL, 2, sizeof(cl_mem), &attnBuf);
 	CHECK_ERROR(err);
-	err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &outBiasBuf);
+	err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &out_bias);
 	CHECK_ERROR(err);
 
     cl_int rowA= tokens;
@@ -452,8 +440,8 @@ void multihead_attn(float *input, float *output,
 		NULL, 
 		global_LL_size, 
 		local_LL_size, 
-		2, 
-		&writeEvent[3], &execEvent[2]);
+		1, 
+		&execEvent[1], &execEvent[2]);
 	CHECK_ERROR(err); 
 
 	err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
@@ -464,18 +452,13 @@ void multihead_attn(float *input, float *output,
     //printf("outputs [0][0:5]: ");
     //for (int i = 0; i < 5; i++) printf("%f ", output[i]);
     //printf("\n");
-    profileEvents(writeEvent, 3, &QKV_WRITE_TIME);
-    profileEvents(writeEvent + 3, 2, &QKV_WRITE_TIME);
+    profileEvents(writeEvent, 1, &QKV_WRITE_TIME);
     profileEvents(execEvent, 1, &QKV_EXEC_TIME);
     profileEvents(execEvent + 1, 1, &QKV_TO_SCORE_EXEC_TIME);
     profileEvents(execEvent + 2, 1, &QKV_FINAL_LL_EXEC_TIME);
     profileEvents(&readEvent, 1, &QKV_READ_TIME);
 
     err = clReleaseMemObject(inputBuf);
-    err = clReleaseMemObject(weightBuf);
-    err = clReleaseMemObject(biasBuf);
-    err = clReleaseMemObject(outWeightBuf);
-    err = clReleaseMemObject(outBiasBuf);
     clReleaseMemObject(attnBuf);
     clReleaseMemObject(qkvBuf);
     free(attn_output);
@@ -484,37 +467,28 @@ void multihead_attn(float *input, float *output,
 }
 
 
-void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, Network weight, Network bias, bool doGelu) {
+void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, cl_mem weight, cl_mem bias, bool doGelu) {
 
     //clock_t startTime = clock();
     cl_int err;
-    cl_event writeEvent[3];
+    cl_event writeEvent;
     cl_event execEvent;
     cl_event readEvent;
 	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
-    cl_mem weightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (in_features * out_features ), NULL, &err);
-    CHECK_ERROR(err);
     cl_mem inputBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * in_features), NULL, &err);
     CHECK_ERROR(err);
-    cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * out_features, NULL, &err);
-    CHECK_ERROR(err);
     
-    err = clEnqueueWriteBuffer(LL_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (in_features * out_features), weight.data , 0, NULL, writeEvent);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(LL_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, 0, NULL, writeEvent + 1);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(LL_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * out_features, bias.data, 0, NULL, writeEvent + 2);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, 0, NULL, &writeEvent );
     CHECK_ERROR(err);
 
 	err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outBuf);
 	CHECK_ERROR(err);
-    err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &weightBuf);
+    err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &weight);
     CHECK_ERROR(err);
     err = clSetKernelArg(LL_KERNEL, 2, sizeof(cl_mem), &inputBuf);
     CHECK_ERROR(err);
-
-    err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &biasBuf);
+    err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &bias);
     CHECK_ERROR(err);
 
     cl_int rowA = tokens;
@@ -542,37 +516,33 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     //};
     //size_t local_size[] = {1, 1};  // Must match TILE_SIZE
 	err = clEnqueueNDRangeKernel(
-		LL_QUEUE,
+		EXEC_COMMAND_QUEUE,
 		LL_KERNEL,
 		2,
 		NULL,
 		global_size,
 		local_size,
-		3,
-		writeEvent,
+		1,
+		&writeEvent,
 		&execEvent);
     CHECK_ERROR(err);
     
-    err = clEnqueueReadBuffer(LL_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, &readEvent);
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, &readEvent);
 	CHECK_ERROR(err); 
-    clFinish(LL_QUEUE); 
+    clFinish(READ_COMMAND_QUEUE); 
 
-    profileEvents(writeEvent, 3, &LL_WRITE_TIME);
+    profileEvents(&writeEvent, 1, &LL_WRITE_TIME);
     profileEvents(&execEvent, 1, &LL_EXEC_TIME);
     profileEvents(&readEvent, 1, &LL_READ_TIME);
     LL_EXEC_COUNT += 1;
 	err = clReleaseMemObject(outBuf);
-	CHECK_ERROR(err); 
-    err = clReleaseMemObject(biasBuf);
-	CHECK_ERROR(err); 
-    err = clReleaseMemObject(weightBuf);
 	CHECK_ERROR(err); 
     err = clReleaseMemObject(inputBuf);
 	CHECK_ERROR(err);
     //printf("ll : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
-void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias, Network fc2_weight, Network fc2_bias)
+void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, cl_mem fc2_weight, cl_mem fc2_bias)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1; // 197
     int Embed_dim = embed_dim;                                            // 768
@@ -589,11 +559,16 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
 
 ////////////////////////////////////// Encoder Architecture //////////////////////////////////////
 void Encoder(float *input, float *output,
-             Network ln1_w, Network ln1_b, Network attn_w, Network attn_b, 
-             Network attn_out_w, Network attn_out_b, Network ln2_w, Network ln2_b, 
-             Network mlp1_w, Network mlp1_b, Network mlp2_w, Network mlp2_b)
+             cl_mem ln1_w, cl_mem ln1_b, cl_mem attn_w, cl_mem attn_b, 
+             cl_mem attn_out_w, cl_mem attn_out_b, cl_mem ln2_w, cl_mem ln2_b, 
+             cl_mem mlp1_w, cl_mem mlp1_b, cl_mem mlp2_w, cl_mem mlp2_b)
 {
     encoderCount += 1;
+    //printf("\n ln1  : %d %d", ln1_w.size, ln1_b.size);
+    //printf("\n attn : %d %d %d %d", attn_w.size, attn_b.size, attn_out_w.size, attn_out_b.size);
+    //printf("\n ln2  : %d %d", ln2_w.size, ln2_b.size);
+    //printf("\n mlp1 : %d %d", mlp1_w.size, mlp1_b.size);
+    //printf("\n mlp2 : %d %d", mlp2_w.size, mlp2_b.size);
 
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
@@ -697,18 +672,18 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     CHECK_ERROR(err);
 
     int token_size = ((img_size / patch_size) * (img_size / patch_size) + 1);
-    float *layer[4];
-    float *enc_layer[12];
+    float *layer[3];
+    float *enc_layer[13];
     float *enc_output;
     int hidden_dim = ((int)(embed_dim * mlp_ratio));
     // printf("%d %d = %d\n", token_size, hidden_dim, token_size * hidden_dim);
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 3; i++)
     {
         layer[i] = (float *)malloc(sizeof(float) * size[i]);
         if (layer[i] == NULL) printf("malloc failed in line %d\n", __LINE__);
     }
-    for (int i = 0; i < 12; i++)
+    for (int i = 0; i < 13; i++)
     {
         enc_layer[i] = (float *)malloc(sizeof(float) * enc_size);
         if (enc_layer[i] == NULL) printf("malloc failed in line %d\n", __LINE__);
@@ -730,7 +705,6 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
     QKV_TO_SCOREV_KERNEL = clCreateKernel(MULTIHEAD_PROGRAM, "QKV_TO_SCOREV", &err);
     CHECK_ERROR(err);
-
 
 	cl_queue_properties props[] = {
 		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE,
@@ -758,10 +732,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
     // for conv2d
     kernel_source = get_source_code("conv2d.cl", &kernel_source_size);
-    CONV2D_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source,
-        &kernel_source_size, &err);
+    CONV2D_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
     CHECK_ERROR(err);
-
     err = clBuildProgram(CONV2D_PROGRAM, 1, &DEVICE, "", NULL, NULL);
     build_error(CONV2D_PROGRAM, DEVICE, err);
     CHECK_ERROR(err);
@@ -773,14 +745,21 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	LAYERNORM_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
 	CHECK_ERROR(err);
 	CHECK_ERROR(clBuildProgram(LAYERNORM_PROGRAM, 1, &DEVICE, "", NULL, NULL));
-	build_error(CONV2D_PROGRAM, DEVICE, err);
+	build_error(LAYERNORM_PROGRAM, DEVICE, err);
+	CHECK_ERROR(err);
+    LAYERNORM_KERNEL= clCreateKernel(LAYERNORM_PROGRAM, "layerNorm", &err);
 	CHECK_ERROR(err);
 	
     printf("setup time: %.6f sec\n\n" , (double)(clock() - setupTime) / CLK_TCK);
     //printSpec();
 
-    //test_linear_layer();
-    //test_linear_layer_big();
+    EncoderWeights encoderWeightBuffers[2];
+    FinalWeight finalWeights = initFinalWeight(networks);
+    encoderWeightBuffers[0] = initEncoderWeight();
+    encoderWeightBuffers[1] = initEncoderWeight();
+    printf("init done\n");
+    fillFinalWeight(finalWeights, networks);
+    printf("writing final weight done\n");
     for (int i = 0; i < image->n; i++)
     {
         double startTime = clock();
@@ -791,25 +770,26 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         /*prepend class token*/
         class_token(layer[1], layer[2], networks[0]);
         /*position embedding*/
-        pos_emb(layer[2], layer[3], networks[3]); 
+        pos_emb(layer[2], enc_layer[0], networks[3]); 
         printf("pre-processing : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
         /*Encoder - 12 Layers*/
-        Encoder(layer[3], enc_layer[0],
-            networks[4], networks[5], networks[6], networks[7],
-            networks[8], networks[9], networks[10], networks[11],
-            networks[12], networks[13], networks[14], networks[15]);
 
-        for (int j = 1; j < 12; j++) {
-            Encoder(enc_layer[j - 1], enc_layer[j],
-                networks[4 + j * 12], networks[5 + j * 12], networks[6 + j * 12], networks[7 + j * 12],
-                networks[8 + j * 12], networks[9 + j * 12], networks[10 + j * 12], networks[11 + j * 12],
-                networks[12 + j * 12], networks[13 + j * 12], networks[14 + j * 12], networks[15 + j * 12]);
+        for (int j = 0; j < 12; j++) {
+            fillEncoderWeight(encoderWeightBuffers[0], networks, j);
+            //Encoder(enc_layer[j], enc_layer[j + 1],
+            //    networks[4 + j * 12], networks[5 + j * 12], networks[6 + j * 12], networks[7 + j * 12],
+            //    networks[8 + j * 12], networks[9 + j * 12], networks[10 + j * 12], networks[11 + j * 12],
+            //    networks[12 + j * 12], networks[13 + j * 12], networks[14 + j * 12], networks[15 + j * 12]);
+            Encoder(enc_layer[j], enc_layer[j + 1],
+                encoderWeightBuffers[0].ln1_w, encoderWeightBuffers[0].ln1_b, encoderWeightBuffers[0].attn_w, encoderWeightBuffers[0].attn_b,
+                encoderWeightBuffers[0].attn_out_w, encoderWeightBuffers[0].attn_out_b, encoderWeightBuffers[0].ln2_w, encoderWeightBuffers[0].ln2_b,
+                encoderWeightBuffers[0].mlp1_w, encoderWeightBuffers[0].mlp1_b, encoderWeightBuffers[0].mlp2_w, encoderWeightBuffers[0].mlp2_b);
         }
 
         for (int asdf = 0; asdf < 12; asdf += 1)
             if (findNaN(enc_layer[asdf], 197, embed_dim)) printf("%d has nan", asdf);
          
-        layer_norm(enc_layer[11], enc_output, networks[148], networks[149]);
+        layer_norm(enc_layer[12], enc_output, finalWeights.ln_w, finalWeights.ln_b);
 
         /* Token 값 추출 */
         float *cls_token = (float *)malloc(sizeof(float) * embed_dim);
@@ -818,7 +798,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         if (cls_output == NULL) printf("malloc failed\n");
         memcpy(cls_token, enc_output, sizeof(float) * embed_dim);
 
-        linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151], false);
+        linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, finalWeights.mlp_w, finalWeights.mlp_b, false);
         /* 확률분포 추출 */
         Softmax(cls_output, probabilities[i], num_classes);
 
@@ -838,11 +818,128 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(clReleaseCommandQueue(WRITE_COMMAND_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(EXEC_COMMAND_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(READ_COMMAND_QUEUE));
-
     err = clReleaseContext(CONTEXT);
+
     CHECK_ERROR(err);
 }
 
+EncoderWeights initEncoderWeight() {
+    EncoderWeights weights;
+	cl_int err;
+    int hidden_dim = ((int)(embed_dim * mlp_ratio));
+
+    weights.ln1_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln1_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * embed_dim * 3, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * 3, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_out_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_out_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln2_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln2_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp1_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp1_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp2_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp2_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    return weights;
+}
+
+void fillEncoderWeight(EncoderWeights weights, Network* networkList, int encoderIndex) {
+    cl_int err;
+    int base = 4 + encoderIndex * 12;
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln1_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base].size,
+        networkList[base].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln1_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 1].size,
+        networkList[base + 1].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.attn_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 2].size,
+        networkList[base + 2].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.attn_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 3].size,
+        networkList[base + 3].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.attn_out_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 4].size,
+        networkList[base + 4].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.attn_out_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 5].size,
+        networkList[base + 5].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln2_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 6].size,
+        networkList[base + 6].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln2_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 7].size,
+        networkList[base + 7].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp1_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 8].size,
+        networkList[base + 8].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp1_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 9].size,
+        networkList[base + 9].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp2_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 10].size,
+        networkList[base + 10].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp2_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 11].size,
+        networkList[base + 11].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    clFinish(WRITE_COMMAND_QUEUE);
+}
+
+FinalWeight initFinalWeight(Network* networkList) {
+    FinalWeight weights;
+    cl_int err;
+
+	weights.ln_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[148].size, NULL, &err);
+	CHECK_ERROR(err);
+	weights.ln_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[149].size, NULL, &err);
+    CHECK_ERROR(err);
+	weights.mlp_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[150].size, NULL, &err);
+	CHECK_ERROR(err);
+	weights.mlp_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[151].size, NULL, &err);
+	CHECK_ERROR(err);
+
+    return weights;
+}
+
+void fillFinalWeight(FinalWeight weights, Network* networkList) {
+    cl_int err;
+    
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln_w, CL_FALSE, 0, sizeof(float) * networkList[148].size, networkList[148].data, 0, NULL, NULL);
+	CHECK_ERROR(err);
+	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln_b, CL_FALSE, 0, sizeof(float) * networkList[149].size, networkList[149].data, 0, NULL, NULL);
+	CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp_w, CL_FALSE, 0, sizeof(float) * networkList[150].size, networkList[150].data, 0, NULL, NULL);
+	CHECK_ERROR(err);
+	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp_b, CL_FALSE, 0, sizeof(float) * networkList[151].size, networkList[151].data, 0, NULL, NULL);
+	CHECK_ERROR(err);
+
+    clFinish(WRITE_COMMAND_QUEUE);
+}
 
 void printSpec() {
     cl_uint num_platforms;
@@ -1110,37 +1207,6 @@ void printEventProfile() {
     printf("\n=======================================\n");
 }
 
-
-void test_linear_layer(){
-    // Simple 3×2 input, 2×4 weight
-    float input[6] = {1, 2,  3, 4,  5, 6};       // [3, 2]
-    float weight[8] = {1, 0, 0, 1,  0, 1, 1, 0}; // [4, 2]
-    //float bias[4] = {1, 1, 1, 1};
-    float bias[4] = {0, 0, 0, 0};
-    float output[12];  // [3, 4]
-
-
-    Network weight_net = { weight, 8 };
-    Network bias_net = { bias, 4 };
-    
-    // Expected output:
-    // [1, 2, 2, 1]
-    // [3, 4, 4, 3]
-    // [5, 6, 6, 5]
-    
-    // Run your kernel
-    linear_layer(input, output, 3, 2, 4, weight_net, bias_net, false);
-    
-    // Check results
-    printf("Output:\n");
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 4; j++) {
-            printf("%.1f ", output[i * 4 + j]);
-        }
-        printf("\n");
-    }
-}
-
 bool findNaN(float* a, int tokens, int embedings) {
     int count = 0;
     for (int i = 0; i < tokens; i++) {
@@ -1153,55 +1219,86 @@ bool findNaN(float* a, int tokens, int embedings) {
 
     return false;
 }
-void test_linear_layer_big(){
-    float input[17 * 32];    
-    float weight[32 * 32];
-    float bias[32] = { 0 };
-    float output[32 * 32];
+//void test_linear_layer(){
+//    // Simple 3×2 input, 2×4 weight
+//    float input[6] = {1, 2,  3, 4,  5, 6};       // [3, 2]
+//    float weight[8] = {1, 0, 0, 1,  0, 1, 1, 0}; // [4, 2]
+//    //float bias[4] = {1, 1, 1, 1};
+//    float bias[4] = {0, 0, 0, 0};
+//    float output[12];  // [3, 4]
+//
+//
+//    Network weight_net = { weight, 8 };
+//    Network bias_net = { bias, 4 };
+//    
+//    // Expected output:
+//    // [1, 2, 2, 1]
+//    // [3, 4, 4, 3]
+//    // [5, 6, 6, 5]
+//    
+//    // Run your kernel
+//    linear_layer(input, output, 3, 2, 4, weight_net, bias_net, false);
+//    
+//    // Check results
+//    printf("Output:\n");
+//    for (int i = 0; i < 3; i++) {
+//        for (int j = 0; j < 4; j++) {
+//            printf("%.1f ", output[i * 4 + j]);
+//        }
+//        printf("\n");
+//    }
+//}
+//
 
-    for (int i = 0; i < 17; i++) {
-        for (int j = 0; j < 32; j++) {
-            input[i * 32 + j] = 1;
-        }
-    }
-    for (int i = 0; i < 32; i++) {
-		for (int j = 0; j < 32; j++) {
-			weight[i * 32 + j] = i;
-		}
-	}
-
-    Network weight_net = { weight, 32*32 };
-    Network bias_net = { bias, 32 };
-    
-    // Expected output:
-    
-    // Run your kernel
-    linear_layer(input, output, 17, 32, 32, weight_net, bias_net, false);
-    
-    // Check results
-    if (findNaN(output, 17, 32)){
-		printf("found Nan during testing");
-        return;
-    }
-
-    printf("Output:\n");
-    for (int i = 0; i < 17; i++) {
-		for (int j = 0; j < 32; j++) {
-            printf("%.1f ", output[i * 32 + j]);
-		}
-        printf("\n");
-	}
-
-
-
-    for (int i = 0; i < 17; i++) {
-        for (int j = 0; j < 32; j++) {
-            if (output[i * 32 + j] != 32 * j) {
-                printf("wrong anwer(%f) on %d %d\n", output[i * 32 + j], i, j);
-                return;
-            }
-        }
-    }
-
-    printf("all good!\n");
-}
+//void test_linear_layer_big(){
+//    float input[17 * 32];    
+//    float weight[32 * 32];
+//    float bias[32] = { 0 };
+//    float output[32 * 32];
+//
+//    for (int i = 0; i < 17; i++) {
+//        for (int j = 0; j < 32; j++) {
+//            input[i * 32 + j] = 1;
+//        }
+//    }
+//    for (int i = 0; i < 32; i++) {
+//		for (int j = 0; j < 32; j++) {
+//			weight[i * 32 + j] = i;
+//		}
+//	}
+//
+//    Network weight_net = { weight, 32*32 };
+//    Network bias_net = { bias, 32 };
+//    
+//    // Expected output:
+//    
+//    // Run your kernel
+//    linear_layer(input, output, 17, 32, 32, weight_net, bias_net, false);
+//    
+//    // Check results
+//    if (findNaN(output, 17, 32)){
+//		printf("found Nan during testing");
+//        return;
+//    }
+//
+//    printf("Output:\n");
+//    for (int i = 0; i < 17; i++) {
+//		for (int j = 0; j < 32; j++) {
+//            printf("%.1f ", output[i * 32 + j]);
+//		}
+//        printf("\n");
+//	}
+//
+//
+//
+//    for (int i = 0; i < 17; i++) {
+//        for (int j = 0; j < 32; j++) {
+//            if (output[i * 32 + j] != 32 * j) {
+//                printf("wrong anwer(%f) on %d %d\n", output[i * 32 + j], i, j);
+//                return;
+//            }
+//        }
+//    }
+//
+//    printf("all good!\n");
+//}

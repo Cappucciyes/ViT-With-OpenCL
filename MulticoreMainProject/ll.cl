@@ -42,8 +42,6 @@ __kernel void linear_layer(
         }
 
         // Load weight tile: weight[gj][tileStart + li]
-        // CRITICAL: We're computing output[gi][gj] = sum_k input[gi][k] * weight[gj][k]
-        // So we need weight[gj][tileStart + li], but stored as weightTile[li][lj]
         int weightCol = tileStart + li;
         if (gj < colB && weightCol < colA) {
             weightTile[li][lj] = weight[gj * colA + weightCol];
