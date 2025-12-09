@@ -43,6 +43,7 @@ __kernel void QKV_TO_SCOREV(
     __local float score_local[256];
     __local float maxReduce[256];
     __local float toReduce[256];
+
     
     // Compute Q·K scores for this token t and head h
     if (localIndex < tokens) {

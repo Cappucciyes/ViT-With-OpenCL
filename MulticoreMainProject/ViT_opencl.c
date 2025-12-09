@@ -71,11 +71,17 @@ cl_ulong LAYERNORM_EXEC_TIME;
 cl_ulong LAYERNORM_READ_TIME;
 double LAYERNORM_TOTAL_TIME;
 int LAYERNORM_EXEC_COUNT;
+
+int encoderCount;
 ////////////////////////////////////// utils function //////////////////////////////////////
 void printSpec();
 void profileEvents(cl_event* events, int eventCount, cl_ulong* timeGlobalVariable);
-void printEventProfile();
 
+// testing 
+void printEventProfile();
+void test_linear_layer();
+bool findNaN(float* a, int tokens, int embedings);
+void test_linear_layer_big();
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
 void Conv2d(float* input, float* output, Network weight, Network bias)
@@ -311,9 +317,9 @@ void multihead_attn(float *input, float *output,
     
     err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, writeEvent + 1);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, &writeEvent[1]);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * 3), in_bias.data, 0, NULL, writeEvent + 2);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * 3), in_bias.data, 0, NULL, &writeEvent[2]);
 	CHECK_ERROR(err);
 
    	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -345,7 +351,7 @@ void multihead_attn(float *input, float *output,
 		execEvent); 
     CHECK_ERROR(err);
     err = clReleaseMemObject(inputBuf);
-
+    
     // --- 
     int print_tokens = tokens < 5 ? tokens : 5;
     int print_dims = embed_dim < 10 ? embed_dim : 10;
@@ -379,17 +385,17 @@ void multihead_attn(float *input, float *output,
         global_QKV_TO_SCOREV_size, 
         local_QKV_TO_SCOREV_size, 
         1, 
-        execEvent, execEvent + 1);
+        execEvent, &execEvent[1]);
     CHECK_ERROR(err);
-
     // 최종 선형 프로젝션
     cl_mem outputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
 	CHECK_ERROR(err);
 
-    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim), out_weight.data, 1, execEvent + 1, writeEvent + 3);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim), out_weight.data, 1, &execEvent[1], &writeEvent[3]);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, execEvent + 1, writeEvent + 4);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, &execEvent[1], &writeEvent[4]);
 	CHECK_ERROR(err);
+
     err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outputBuf);
 	CHECK_ERROR(err);
 	err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &weightBuf);
@@ -398,21 +404,26 @@ void multihead_attn(float *input, float *output,
 	CHECK_ERROR(err);
 	err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &biasBuf);
 	CHECK_ERROR(err);
-	cl_int outCount= embed_dim;
-	err = clSetKernelArg(LL_KERNEL, 4, sizeof(cl_int), &outCount);
+
+    cl_int rowA= tokens;
+	cl_int colA= embed_dim;
+	cl_int colB= embed_dim; 
+	err = clSetKernelArg(LL_KERNEL, 4, sizeof(cl_int), &rowA);
+	CHECK_ERROR(err); 
+	err = clSetKernelArg(LL_KERNEL, 5, sizeof(cl_int), &colA);
 	CHECK_ERROR(err);
-	cl_int featureCount= embed_dim; 
-	err = clSetKernelArg(LL_KERNEL, 5, sizeof(cl_int), &featureCount);
+	err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &colB);
 	CHECK_ERROR(err);
+
     cl_int doGelu = 0;
-    err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &doGelu);
+    err = clSetKernelArg(LL_KERNEL, 7, sizeof(cl_int), &doGelu);
 	CHECK_ERROR(err);
 
     int tileSize = 16;
 
     size_t global_LL_size[] = {
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
-        ((embed_dim+ tileSize - 1) / tileSize) * tileSize
+        ((embed_dim + tileSize - 1) / tileSize) * tileSize
     };
     size_t local_LL_size[] = { tileSize, tileSize };
 	err = clEnqueueNDRangeKernel(
@@ -423,10 +434,10 @@ void multihead_attn(float *input, float *output,
 		global_LL_size, 
 		local_LL_size, 
 		2, 
-		writeEvent + 3, execEvent + 2);
+		&writeEvent[3], &execEvent[2]);
 	CHECK_ERROR(err); 
 
-	err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, execEvent + 2, &readEvent);
+	err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
 	CHECK_ERROR(err);
 
     //clWaitForEvents(1, &readEvent);
@@ -491,22 +502,26 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
 
     err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &biasBuf);
     CHECK_ERROR(err);
-    cl_int outCount = out_features;
-    err = clSetKernelArg(LL_KERNEL, 4, sizeof(cl_int), &outCount);
-    CHECK_ERROR(err);
-    cl_int featureCount= in_features;
-    err = clSetKernelArg(LL_KERNEL, 5, sizeof(cl_int), &featureCount);
-    CHECK_ERROR(err);
 
+    cl_int rowA = tokens;
+    cl_int colA= in_features;
+    cl_int colB= out_features;
+    err = clSetKernelArg(LL_KERNEL, 4, sizeof(cl_int), &rowA);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(LL_KERNEL, 5, sizeof(cl_int), &colA);
+    CHECK_ERROR(err);
+    err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &colB);
+	CHECK_ERROR(err);
     cl_int activateGelu = doGelu ? 1 : 0;
-    err = clSetKernelArg(LL_KERNEL, 6, sizeof(cl_int), &activateGelu);
+    err = clSetKernelArg(LL_KERNEL, 7, sizeof(cl_int), &activateGelu);
 	CHECK_ERROR(err); 
-    int tileSize = 16;
 
+    int tileSize = 16;
 	size_t global_size[] = {
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
         ((out_features + tileSize - 1) / tileSize) * tileSize
     };
+
     size_t local_size[] = {tileSize, tileSize};  // Must match TILE_SIZE
 	err = clEnqueueNDRangeKernel(
 		LL_QUEUE,
@@ -550,6 +565,7 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
     
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
     linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
+    if (findNaN(output, tokens, embed_dim)) printf("ll asdf is nan\n");
     free(fc1_out);
 }
 
@@ -558,6 +574,7 @@ void Encoder(float *input, float *output,
              Network ln1_w, Network ln1_b, Network attn_w, Network attn_b, Network attn_out_w, Network attn_out_b,
              Network ln2_w, Network ln2_b, Network mlp1_w, Network mlp1_b, Network mlp2_w, Network mlp2_b)
 {
+    encoderCount += 1;
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
 	if (ln1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
@@ -572,9 +589,11 @@ void Encoder(float *input, float *output,
 
     /*LN1*/
     layer_norm(input, ln1_out, ln1_w, ln1_b);
+    //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 1 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
 
     /*Attn*/
     multihead_attn(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b);
+    //if (findNaN(ln1_out, tokens, embed_dim)) printf("multihead is nan on %d, encoder:%d\n", __LINE__, encoderCount);
 
     /*Residual1*/
     for (int i = 0; i < tokens * embed_dim; i++)
@@ -584,6 +603,7 @@ void Encoder(float *input, float *output,
 
     /*LN2*/
     layer_norm(residual, ln2_out, ln2_w, ln2_b);
+    //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 2 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
 
     /*MLP*/
     mlp_block(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b);
@@ -593,7 +613,6 @@ void Encoder(float *input, float *output,
     {
         output[i] = residual[i] + mlp_out[i];
     }
-
     free(ln1_out);
     free(attn_out);
     free(residual);
@@ -637,6 +656,8 @@ const int size[] = {
 };
 
 const int enc_size = embed_dim * ((img_size / patch_size) * (img_size / patch_size) + 1);
+
+
 
 ////////////////////////////////////// Model Architecture //////////////////////////////////////
 void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
@@ -738,6 +759,9 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
     printf("setup time: %.6f sec\n\n" , (double)(clock() - setupTime) / CLK_TCK);
     //printSpec();
+
+    //test_linear_layer();
+    //test_linear_layer_big();
     for (int i = 0; i < image->n; i++)
     {
         double startTime = clock();
@@ -811,7 +835,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
                 networks[136], networks[137], networks[138], networks[139],
                 networks[140], networks[141], networks[142], networks[143],
                 networks[144], networks[145], networks[146], networks[147]);
-
+         
         layer_norm(enc_layer[11], enc_output, networks[148], networks[149]);
 
         /* Token 값 추출 */
@@ -823,12 +847,11 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
         linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151], false);
         /* 확률분포 추출 */
-        //time_t softmaxTime = clock();
         Softmax(cls_output, probabilities[i], num_classes);
-        //printf("softmax: %.6f sec\n", (double)(clock() - softmaxTime) / CLK_TCK);
+
         printf("picture #%d: %.6f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
     }
-    printEventProfile();
+    //printEventProfile();
 
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
@@ -1113,4 +1136,91 @@ void printEventProfile() {
         }
     }
     printf("\n=======================================\n");
+}
+
+
+void test_linear_layer(){
+    // Simple 3×2 input, 2×4 weight
+    float input[6] = {1, 2,  3, 4,  5, 6};       // [3, 2]
+    float weight[8] = {1, 0, 0, 1,  0, 1, 1, 0}; // [4, 2]
+    //float bias[4] = {1, 1, 1, 1};
+    float bias[4] = {0, 0, 0, 0};
+    float output[12];  // [3, 4]
+
+
+    Network weight_net = { weight, 8 };
+    Network bias_net = { bias, 4 };
+    
+    // Expected output:
+    // [1, 2, 2, 1]
+    // [3, 4, 4, 3]
+    // [5, 6, 6, 5]
+    
+    // Run your kernel
+    linear_layer(input, output, 3, 2, 4, weight_net, bias_net, false);
+    
+    // Check results
+    printf("Output:\n");
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 4; j++) {
+            printf("%.1f ", output[i * 4 + j]);
+        }
+        printf("\n");
+    }
+}
+
+bool findNaN(float* a, int tokens, int embedings) {
+    int count = 0;
+    for (int i = 0; i < tokens; i++) {
+        for (int j = 0; j < embedings; j++)
+            if (a[i * embedings + j] != a[i * embedings + j]) {
+                printf("found NaN on %d %d\n", i, j);
+                return true;
+            }
+    }
+
+    return false;
+}
+void test_linear_layer_big(){
+    float input[17 * 32];    
+    float weight[32 * 32];
+    float bias[32] = { 0 };
+    float output[32 * 32];
+
+    for (int i = 0; i < 17; i++) {
+        for (int j = 0; j < 32; j++) {
+            input[i * 32 + j] = 1;
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+		for (int j = 0; j < 32; j++) {
+			weight[i * 32 + j] = 1;
+		}
+	}
+
+    Network weight_net = { weight, 32*32 };
+    Network bias_net = { bias, 32 };
+    
+    // Expected output:
+    
+    // Run your kernel
+    linear_layer(input, output, 17, 32, 32, weight_net, bias_net, false);
+    
+    // Check results
+    if (findNaN(output, 17, 32)){
+		printf("found Nan during testing");
+        return;
+    }
+
+    printf("Output:\n");
+    for (int i = 0; i < 17; i++) {
+        for (int j = 0; j < 32; j++) {
+            if (output[i * 32 + j] != 32) {
+                printf("wrong anwer(%f) on %d %d\n", output[i * 32 + j], i, j);
+                return;
+            }
+        }
+    }
+
+    printf("all good!\n");
 }

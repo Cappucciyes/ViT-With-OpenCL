@@ -9,51 +9,54 @@ __kernel void linear_layer(
     __global float* weight,
     __global float* input,
     __global float* bias,
-    int outCount,
-    int featureCount,
+    int rowA,
+    int colA,
+    int colB,
     int doGelu
 ) {
-    int i = get_global_id(0);
-    int j = get_global_id(1);
-    
+    int tilei = get_group_id(0);
+    int tilej = get_group_id(1);
+
     int li = get_local_id(0);
     int lj = get_local_id(1);
-    
-    if (i >= get_global_size(0) || j >= outCount) return;
-    
+
+    int gi = tilei * TILESIZE + li;
+    int gj = tilej * TILESIZE + lj;
+    //if (gi >= rowA|| gj >= colB) return;
 	__local float inputTile[TILESIZE][TILESIZE];
     __local float weightTile[TILESIZE][TILESIZE];
 
     float result = 0;
     // 타일 수 = 전체 크기를 타일 크기로 나눈 값의 올림.
-    int tileCount= (featureCount + TILESIZE - 1) / TILESIZE;
-
+    int tileCount= (colA + TILESIZE - 1) / TILESIZE;
     for (int tile = 0; tile < tileCount; tile++) {
         int tileStart = tile * TILESIZE;
         
         int inputCol= tileStart+ lj;
-        if (inputCol < featureCount && li < TILESIZE)
-            inputTile[li][lj] = input[i * featureCount + inputCol];
+        if (inputCol < colA && gi < rowA)
+            inputTile[li][lj] = input[gi * colA + inputCol];
         else
             inputTile[li][lj] = 0;
         
-        int weightCol= tileStart + li;
-        if (weightCol < featureCount && lj < TILESIZE) 
-            weightTile[lj][li] = weight[j * featureCount + weightCol];
+        int weightCol= tileStart + lj;
+        if (weightCol < colB && gi < colA) 
+            weightTile[li][lj] = weight[gi * colB + weightCol];
         else
-            weightTile[lj][li] = 0;
+            weightTile[li][lj] = 0;
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        int tileWidth = min(TILESIZE, featureCount - tileStart);
-        for (int k = 0; k < tileWidth; k++) {
-            result += inputTile[li][k] * weightTile[lj][k];
+        for (int k = 0; k < TILESIZE; k++) {
+            result += inputTile[li][k] * weightTile[k][lj];
         } 
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    result += bias[j];
-    if (doGelu == 1)
-		output[i * outCount + j] = gelu(result);
-    else
-		output[i * outCount + j] = result;
+    result += bias[gj];
+    if (gi <= rowA && gj <= colB) {
+        if (doGelu == 1)
+			output[gi * colB + gj] = gelu(result);
+		else
+			output[gi * colB + gj] = result;
+    }
+    
 }
