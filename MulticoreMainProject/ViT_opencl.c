@@ -87,7 +87,8 @@ int encoderCount;
 
 double totalResidualTime;
 
-
+cl_event ENCODER_FLAGS[12 * 5 + 1]; //(layernorm, multihead, layer norm, ll ,ll) * 12 
+cl_event FINAL_FLAG[2]; //(layernorm, ll) * 12 
 
 
 ////////////////////////////////////// utils function //////////////////////////////////////
@@ -165,9 +166,9 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
     CHECK_ERROR(err);
     
     clFinish(READ_COMMAND_QUEUE);
-    profileEvents(writeEvent, 3, &CONV_WRITE_TIME);
-    profileEvents(&execEvent, 1, &CONV_EXEC_TIME);
-    profileEvents(&readEvent, 1, &CONV_READ_TIME);
+    //profileEvents(writeEvent, 3, &CONV_WRITE_TIME);
+    //profileEvents(&execEvent, 1, &CONV_EXEC_TIME);
+    //profileEvents(&readEvent, 1, &CONV_READ_TIME);
     CONV_EXEC_COUNT += 1;
 
     clReleaseMemObject(inputBuf);
@@ -230,19 +231,18 @@ void pos_emb(float *input, float *output, Network pos_emb)
     }
 }
 
-void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias)
+void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias, cl_event* flagEvents, int flagCount, cl_event* nextFlag)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     cl_int err;
     cl_event writeEvent[1];
     cl_event execEvent;
-    cl_event readEvent;
     cl_mem inputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
     cl_mem outputbuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
     
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, flagCount, flagEvents, writeEvent);
 	CHECK_ERROR(err);
     
     err = clSetKernelArg(LAYERNORM_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -273,13 +273,12 @@ void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias)
 		writeEvent,
 		&execEvent);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, &readEvent);
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, nextFlag);
     CHECK_ERROR(err);
-    clFinish(READ_COMMAND_QUEUE);
 
-    profileEvents(writeEvent, 1, &LAYERNORM_WRITE_TIME);
+    /*profileEvents(writeEvent, 1, &LAYERNORM_WRITE_TIME);
 	profileEvents(&execEvent, 1, &LAYERNORM_EXEC_TIME);
-	profileEvents(&readEvent, 1, &LAYERNORM_READ_TIME);
+	profileEvents(&readEvent, 1, &LAYERNORM_READ_TIME);*/
 	LAYERNORM_EXEC_COUNT += 1;
 
     clReleaseMemObject(inputBuf);
@@ -289,7 +288,7 @@ void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias)
 }
 
 void multihead_attn(float *input, float *output,
-                    cl_mem in_weight, cl_mem in_bias, cl_mem out_weight, cl_mem out_bias)
+                    cl_mem in_weight, cl_mem in_bias, cl_mem out_weight, cl_mem out_bias, cl_event* flagEvent, int flagCount, cl_event* nextFlag)
 {
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     /*Allocate Q, K, V : tokens * dim*/
@@ -305,7 +304,7 @@ void multihead_attn(float *input, float *output,
     cl_mem qkvBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim * 3), NULL, &err);
 	CHECK_ERROR(err);
     
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, flagCount, flagEvent, writeEvent);
     CHECK_ERROR(err);
 
    	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -428,19 +427,16 @@ void multihead_attn(float *input, float *output,
 		&execEvent[1], &execEvent[2]);
 	CHECK_ERROR(err); 
 
-	err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
+	err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], nextFlag);
 	CHECK_ERROR(err);
 
     clFinish(READ_COMMAND_QUEUE);
-    //printf("\n=== Checking final outputs ===\n");
-    //printf("outputs [0][0:5]: ");
-    //for (int i = 0; i < 5; i++) printf("%f ", output[i]);
-    //printf("\n");
-    profileEvents(writeEvent, 1, &QKV_WRITE_TIME);
-    profileEvents(execEvent, 1, &QKV_EXEC_TIME);
-    profileEvents(execEvent + 1, 1, &QKV_TO_SCORE_EXEC_TIME);
-    profileEvents(execEvent + 2, 1, &QKV_FINAL_LL_EXEC_TIME);
-    profileEvents(&readEvent, 1, &QKV_READ_TIME);
+
+    //profileEvents(writeEvent, 1, &QKV_WRITE_TIME);
+    //profileEvents(execEvent, 1, &QKV_EXEC_TIME);
+    //profileEvents(execEvent + 1, 1, &QKV_TO_SCORE_EXEC_TIME);
+    //profileEvents(execEvent + 2, 1, &QKV_FINAL_LL_EXEC_TIME);
+    //profileEvents(&readEvent, 1, &QKV_READ_TIME);
 
     err = clReleaseMemObject(inputBuf);
     clReleaseMemObject(attnBuf);
@@ -451,19 +447,19 @@ void multihead_attn(float *input, float *output,
 }
 
 
-void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, cl_mem weight, cl_mem bias, bool doGelu) {
+void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, cl_mem weight, cl_mem bias, bool doGelu,
+                    cl_event* flagEvent, int flagCount, cl_event* nextFlag) {
 
     //clock_t startTime = clock();
     cl_int err;
     cl_event writeEvent;
     cl_event execEvent;
-    cl_event readEvent;
 	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
     cl_mem inputBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * in_features), NULL, &err);
     CHECK_ERROR(err);
     
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, 0, NULL, &writeEvent );
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * in_features), input, flagCount, flagEvent, &writeEvent );
     CHECK_ERROR(err);
 
 	err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outBuf);
@@ -494,11 +490,7 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
         ((out_features + tileSize - 1) / tileSize) * tileSize
     };
     size_t local_size[] = { tileSize, tileSize };  // Must match TILE_SIZE
-    //size_t global_size[] = {
-    //    tokens,        // Round up to multiple of 16
-    //    out_features
-    //};
-    //size_t local_size[] = {1, 1};  // Must match TILE_SIZE
+
 	err = clEnqueueNDRangeKernel(
 		EXEC_COMMAND_QUEUE,
 		LL_KERNEL,
@@ -511,13 +503,13 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
 		&execEvent);
     CHECK_ERROR(err);
     
-    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, &readEvent);
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, nextFlag);
 	CHECK_ERROR(err); 
     clFinish(READ_COMMAND_QUEUE); 
 
-    profileEvents(&writeEvent, 1, &LL_WRITE_TIME);
-    profileEvents(&execEvent, 1, &LL_EXEC_TIME);
-    profileEvents(&readEvent, 1, &LL_READ_TIME);
+    //profileEvents(&writeEvent, 1, &LL_WRITE_TIME);
+    //profileEvents(&execEvent, 1, &LL_EXEC_TIME);
+    //profileEvents(&readEvent, 1, &LL_READ_TIME);
     LL_EXEC_COUNT += 1;
 	err = clReleaseMemObject(outBuf);
 	CHECK_ERROR(err); 
@@ -526,7 +518,7 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     //printf("ll : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
-void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, cl_mem fc2_weight, cl_mem fc2_bias)
+void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, cl_mem fc2_weight, cl_mem fc2_bias, cl_event* firstFlag, cl_event* secondFlag, cl_event* finalFlag)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1; // 197
     int Embed_dim = embed_dim;                                            // 768
@@ -535,21 +527,20 @@ void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
 	if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
     
-    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
-    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
+    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true, firstFlag, 1, secondFlag); 
+    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false,secondFlag, 1, finalFlag);
     if (findNaN(output, tokens, embed_dim)) printf("ll asdf is nan\n");
     free(fc1_out);
 }
 
 ////////////////////////////////////// Encoder Architecture //////////////////////////////////////
-void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent,
+void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent, 
              cl_mem ln1_w, cl_mem ln1_b, cl_mem attn_w, cl_mem attn_b, 
              cl_mem attn_out_w, cl_mem attn_out_b, cl_mem ln2_w, cl_mem ln2_b, 
              cl_mem mlp1_w, cl_mem mlp1_b, cl_mem mlp2_w, cl_mem mlp2_b)
 {
-    clWaitForEvents(12, currentlyLoadingEvent);
-    profileEvents(currentlyLoadingEvent, 12, &OFF_WRITE_TIME);
-    encoderCount += 1;
+
+
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
 	if (ln1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
@@ -562,12 +553,17 @@ void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent,
     float *mlp_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
 	if (mlp_out== NULL) printf("malloc failed in line %d\n", __LINE__);
 
+    //if (encoderCount == 0) printf("%d\n", encoderCount);
+    
+    int flagStartIndex = 12 * encoderCount;
+    clEnqueueMarkerWithWaitList(EXEC_COMMAND_QUEUE, 12, currentlyLoadingEvent, &ENCODER_FLAGS[flagStartIndex]); // dummy
+
     /*LN1*/
-    layer_norm(input, ln1_out, ln1_w, ln1_b);
+    layer_norm(input, ln1_out, ln1_w, ln1_b, &ENCODER_FLAGS[flagStartIndex], 1, &ENCODER_FLAGS[flagStartIndex + 1]);
     //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 1 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
 
     /*Attn*/
-    multihead_attn(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b);
+    multihead_attn(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b, &ENCODER_FLAGS[flagStartIndex + 1], 1,&ENCODER_FLAGS[flagStartIndex + 2]);
     //if (findNaN(ln1_out, tokens, embed_dim)) printf("multihead is nan on %d, encoder:%d\n", __LINE__, encoderCount);
 
     /*Residual1*/
@@ -578,11 +574,12 @@ void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent,
     }
     totalResidualTime += (double)(clock() - residualTime) / CLK_TCK;
     /*LN2*/
-    layer_norm(residual, ln2_out, ln2_w, ln2_b);
+    layer_norm(residual, ln2_out, ln2_w, ln2_b, &ENCODER_FLAGS[flagStartIndex + 2], 1, &ENCODER_FLAGS[flagStartIndex + 3]);
     //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 2 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
 
     /*MLP*/
-    mlp_block(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b);
+
+    mlp_block(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b , &ENCODER_FLAGS[flagStartIndex + 3],  &ENCODER_FLAGS[flagStartIndex + 4], &ENCODER_FLAGS[flagStartIndex + 5]);
 
     /*Residual2*/
     residualTime = clock();
@@ -596,6 +593,8 @@ void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent,
     free(residual);
     free(ln2_out);
     free(mlp_out);
+    
+    encoderCount = (encoderCount + 1) % 12;
 }
 
 void Softmax(float *logits, float *probabilities, int length)
@@ -747,7 +746,10 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     encoderWeightBuffers[0] = initEncoderWeight();
     encoderWeightBuffers[1] = initEncoderWeight();
 
-    cl_event pingPongEvent[2][24];
+    cl_event pingEvent[24];
+    cl_event pongEvent[24];
+
+    cl_event* pingPongEvent[] = {pingEvent, pongEvent};
 
     fillFinalWeight(finalWeights, networks);
     for (int i = 0; i < image->n; i++)
@@ -765,11 +767,11 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         /*Encoder - 12 Layers*/
         cl_event encoderWeightLoadingEvent[2][24];
 
-        fillEncoderWeight(encoderWeightBuffers[0], networks, 0, encoderWritingPipe[0],&(encoderWeightLoadingEvent[0]));
+        fillEncoderWeight(encoderWeightBuffers[0], networks, 0, encoderWritingPipe[0],pingPongEvent[0]);
         for (int j = 0; j < 12; j++) {
             if (j + 1 < 12) 
-				fillEncoderWeight(encoderWeightBuffers[(j + 1) % 2], networks, j + 1, encoderWritingPipe[(j + 1) % 2], &(encoderWeightLoadingEvent[(j + 1) % 2]));
-            Encoder(enc_layer[j], enc_layer[j + 1], &(encoderWeightLoadingEvent[j % 2]),
+				fillEncoderWeight(encoderWeightBuffers[(j + 1) % 2], networks, j + 1, encoderWritingPipe[(j + 1) % 2], pingPongEvent[(j+1) % 2]);
+            Encoder(enc_layer[j], enc_layer[j + 1], pingPongEvent[j % 2],
                 encoderWeightBuffers[j%2].ln1_w, encoderWeightBuffers[j%2].ln1_b, encoderWeightBuffers[j%2].attn_w, encoderWeightBuffers[j%2].attn_b,
                 encoderWeightBuffers[j%2].attn_out_w, encoderWeightBuffers[j%2].attn_out_b, encoderWeightBuffers[j%2].ln2_w, encoderWeightBuffers[j%2].ln2_b,
                 encoderWeightBuffers[j%2].mlp1_w, encoderWeightBuffers[j%2].mlp1_b, encoderWeightBuffers[j%2].mlp2_w, encoderWeightBuffers[j%2].mlp2_b);
@@ -779,7 +781,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         for (int asdf = 0; asdf <= 12; asdf += 1)
             if (findNaN(enc_layer[asdf], 197, embed_dim)) printf("%d has nan", asdf);
         
-        layer_norm(enc_layer[12], enc_output, finalWeights.ln_w, finalWeights.ln_b);
+        layer_norm(enc_layer[12], enc_output, finalWeights.ln_w, finalWeights.ln_b, &ENCODER_FLAGS[60], 1, FINAL_FLAG);
 
         /* Token 값 추출 */
         float *cls_token = (float *)malloc(sizeof(float) * embed_dim);
@@ -788,14 +790,13 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         if (cls_output == NULL) printf("malloc failed\n");
         memcpy(cls_token, enc_output, sizeof(float) * embed_dim);
 
-        linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, finalWeights.mlp_w, finalWeights.mlp_b, false);
+        linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, finalWeights.mlp_w, finalWeights.mlp_b, false, FINAL_FLAG, 1, NULL);
         /* 확률분포 추출 */
         Softmax(cls_output, probabilities[i], num_classes);
 
         printf("picture #%d: %.6f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
     }
-    printf("residual: %.6f sec\n", totalResidualTime);
-    printEventProfile();
+    //printEventProfile();
 
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
