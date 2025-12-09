@@ -22,7 +22,7 @@
 
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
-void Conv2d(float *input, float *output, Network weight, Network bias)
+void Conv2d_seq(float *input, float *output, Network weight, Network bias)
 {
     int output_size = img_size / patch_size;
 
@@ -56,7 +56,7 @@ void Conv2d(float *input, float *output, Network weight, Network bias)
     }
 }
 
-void flatten_transpose(float *input, float *output)
+void flatten_transpose_seq(float *input, float *output)
 {
     int output_size = img_size / patch_size;
     int num_patches = output_size * output_size;
@@ -80,7 +80,7 @@ void flatten_transpose(float *input, float *output)
     }
 }
 
-void class_token(float *patch_tokens, float *final_tokens, Network cls_tk)
+void class_token_seq(float *patch_tokens, float *final_tokens, Network cls_tk)
 {
     // 이미지의 패치 수 계산: output_size = img_size / patch_size, num_patches = output_size^2
     int output_size = img_size / patch_size;
@@ -104,7 +104,7 @@ void class_token(float *patch_tokens, float *final_tokens, Network cls_tk)
     // printf("\n");
 }
 
-void pos_emb(float *input, float *output, Network pos_emb)
+void pos_emb_seq(float *input, float *output, Network pos_emb_seq)
 {
     // output_size: 한 변의 패치 수, num_patches: 전체 패치 수, total_tokens: class token + patch tokens
     int output_size = img_size / patch_size;
@@ -113,11 +113,11 @@ void pos_emb(float *input, float *output, Network pos_emb)
     int total_elements = total_tokens * embed_dim;
     for (int i = 0; i < total_elements; i++)
     {
-        output[i] = input[i] + pos_emb.data[i];
+        output[i] = input[i] + pos_emb_seq.data[i];
     }
 }
 
-void layer_norm(float *input, float *output, Network weight, Network bias)
+void layer_norm_seq(float *input, float *output, Network weight, Network bias)
 {
     int token = ((img_size / patch_size) * (img_size / patch_size)) + 1;
 
@@ -141,8 +141,8 @@ void layer_norm(float *input, float *output, Network weight, Network bias)
     }
 }
 
-void multihead_attn(float *input, float *output,
-                    Network in_weight, Network in_bias, Network out_weight, Network out_bias)
+void multihead_attn_seq(float *input, float *output,
+                        Network in_weight, Network in_bias, Network out_weight, Network out_bias)
 {
 
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
@@ -285,7 +285,7 @@ void gelu_activation(float *input, float *output, int size)
     }
 }
 
-void linear_layer(float *input, float *output, int tokens, int in_features, int out_features, Network weight, Network bias)
+void linear_layer_seq(float *input, float *output, int tokens, int in_features, int out_features, Network weight, Network bias)
 {
     for (int t = 0; t < tokens; t++)
     {
@@ -300,7 +300,7 @@ void linear_layer(float *input, float *output, int tokens, int in_features, int 
         }
     }
 }
-void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias, Network fc2_weight, Network fc2_bias)
+void mlp_block_seq(float *input, float *output, Network fc1_weight, Network fc1_bias, Network fc2_weight, Network fc2_bias)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1; // 197
     int Embed_dim = embed_dim;                                            // 768
@@ -308,19 +308,19 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
 
-    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias);
+    linear_layer_seq(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias);
     // GELU 활성화
     for (int i = 0; i < tokens * hidden_dim; i++)
     {
         fc1_out[i] = gelu(fc1_out[i]);
     }
     // fc2: (tokens, in_dim)
-    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias);
+    linear_layer_seq(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias);
     free(fc1_out);
 }
 
-////////////////////////////////////// Encoder Architecture //////////////////////////////////////
-void Encoder(float *input, float *output,
+////////////////////////////////////// Encoder_seq Architecture //////////////////////////////////////
+void Encoder_seq(float *input, float *output,
              Network ln1_w, Network ln1_b, Network attn_w, Network attn_b, Network attn_out_w, Network attn_out_b,
              Network ln2_w, Network ln2_b, Network mlp1_w, Network mlp1_b, Network mlp2_w, Network mlp2_b)
 {
@@ -332,10 +332,10 @@ void Encoder(float *input, float *output,
     float *mlp_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
 
     /*LN1*/
-    layer_norm(input, ln1_out, ln1_w, ln1_b);
+    layer_norm_seq(input, ln1_out, ln1_w, ln1_b);
 
     /*Attn*/
-    multihead_attn(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b);
+    multihead_attn_seq(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b);
 
     /*Residual1*/
     for (int i = 0; i < tokens * embed_dim; i++)
@@ -344,10 +344,10 @@ void Encoder(float *input, float *output,
     }
 
     /*LN2*/
-    layer_norm(residual, ln2_out, ln2_w, ln2_b);
+    layer_norm_seq(residual, ln2_out, ln2_w, ln2_b);
 
     /*MLP*/
-    mlp_block(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b);
+    mlp_block_seq(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b);
 
     /*Residual2*/
     for (int i = 0; i < tokens * embed_dim; i++)
@@ -362,7 +362,7 @@ void Encoder(float *input, float *output,
     free(mlp_out);
 }
 
-void Softmax(float *logits, float *probabilities, int length)
+void Softmax_seq(float *logits, float *probabilities, int length)
 {
     // 수치 안정성을 위한 최대값 계산
     float max_val = logits[0];
@@ -390,18 +390,21 @@ void Softmax(float *logits, float *probabilities, int length)
 }
 
 ////////////////////////////////////// layer별 size //////////////////////////////////////
-const int size[] = {
-    embed_dim * (img_size / patch_size) * (img_size / patch_size),      // conv2D
-    embed_dim *(img_size / patch_size) * (img_size / patch_size),       // flatten and transpose
-    embed_dim *((img_size / patch_size) * (img_size / patch_size) + 1), // class token
-    embed_dim *((img_size / patch_size) * (img_size / patch_size) + 1)  // position embedding
-};
-
-const int enc_size = embed_dim * ((img_size / patch_size) * (img_size / patch_size) + 1);
 
 ////////////////////////////////////// Model Architecture //////////////////////////////////////
 void ViT_seq(ImageData *image, Network *networks, float **probabilities)
 {
+
+	int size[] = {
+		embed_dim * (img_size / patch_size) * (img_size / patch_size), // conv2D_seq
+
+		embed_dim *(img_size / patch_size) * (img_size / patch_size),       // flatten and transpose
+		embed_dim *((img_size / patch_size) * (img_size / patch_size) + 1), // class token
+		embed_dim *((img_size / patch_size) * (img_size / patch_size) + 1)  // position embedding
+	};
+
+	int enc_size = embed_dim * ((img_size / patch_size) * (img_size / patch_size) + 1);
+
 
     int token_size = ((img_size / patch_size) * (img_size / patch_size) + 1);
     float *layer[4];
@@ -424,85 +427,85 @@ void ViT_seq(ImageData *image, Network *networks, float **probabilities)
     {
         double startTime = clock();
         /*patch embedding*/
-        Conv2d(image[i].data, layer[0], networks[1], networks[2]);
+        Conv2d_seq(image[i].data, layer[0], networks[1], networks[2]);
         /*flatten and transpose*/
-        flatten_transpose(layer[0], layer[1]);
+        flatten_transpose_seq(layer[0], layer[1]);
         /*prepend class token*/
-        class_token(layer[1], layer[2], networks[0]);
+        class_token_seq(layer[1], layer[2], networks[0]);
         /*position embedding*/
-        pos_emb(layer[2], layer[3], networks[3]);
+        pos_emb_seq(layer[2], layer[3], networks[3]);
 
-        /*Encoder - 12 Layers*/
-        Encoder(layer[3], enc_layer[0],
+        /*Encoder_seq - 12 Layers*/
+        Encoder_seq(layer[3], enc_layer[0],
                 networks[4], networks[5], networks[6], networks[7],
                 networks[8], networks[9], networks[10], networks[11],
                 networks[12], networks[13], networks[14], networks[15]);
 
-        Encoder(enc_layer[0], enc_layer[1],
+        Encoder_seq(enc_layer[0], enc_layer[1],
                 networks[16], networks[17], networks[18], networks[19],
                 networks[20], networks[21], networks[22], networks[23],
                 networks[24], networks[25], networks[26], networks[27]);
 
-        Encoder(enc_layer[1], enc_layer[2],
+        Encoder_seq(enc_layer[1], enc_layer[2],
                 networks[28], networks[29], networks[30], networks[31],
                 networks[32], networks[33], networks[34], networks[35],
                 networks[36], networks[37], networks[38], networks[39]);
 
-        Encoder(enc_layer[2], enc_layer[3],
+        Encoder_seq(enc_layer[2], enc_layer[3],
                 networks[40], networks[41], networks[42], networks[43],
                 networks[44], networks[45], networks[46], networks[47],
                 networks[48], networks[49], networks[50], networks[51]);
 
-        Encoder(enc_layer[3], enc_layer[4],
+        Encoder_seq(enc_layer[3], enc_layer[4],
                 networks[52], networks[53], networks[54], networks[55],
                 networks[56], networks[57], networks[58], networks[59],
                 networks[60], networks[61], networks[62], networks[63]);
 
-        Encoder(enc_layer[4], enc_layer[5],
+        Encoder_seq(enc_layer[4], enc_layer[5],
                 networks[64], networks[65], networks[66], networks[67],
                 networks[68], networks[69], networks[70], networks[71],
                 networks[72], networks[73], networks[74], networks[75]);
 
-        Encoder(enc_layer[5], enc_layer[6],
+        Encoder_seq(enc_layer[5], enc_layer[6],
                 networks[76], networks[77], networks[78], networks[79],
                 networks[80], networks[81], networks[82], networks[83],
                 networks[84], networks[85], networks[86], networks[87]);
 
-        Encoder(enc_layer[6], enc_layer[7],
+        Encoder_seq(enc_layer[6], enc_layer[7],
                 networks[88], networks[89], networks[90], networks[91],
                 networks[92], networks[93], networks[94], networks[95],
                 networks[96], networks[97], networks[98], networks[99]);
 
-        Encoder(enc_layer[7], enc_layer[8],
+        Encoder_seq(enc_layer[7], enc_layer[8],
                 networks[100], networks[101], networks[102], networks[103],
                 networks[104], networks[105], networks[106], networks[107],
                 networks[108], networks[109], networks[110], networks[111]);
 
-        Encoder(enc_layer[8], enc_layer[9],
+        Encoder_seq(enc_layer[8], enc_layer[9],
                 networks[112], networks[113], networks[114], networks[115],
                 networks[116], networks[117], networks[118], networks[119],
                 networks[120], networks[121], networks[122], networks[123]);
 
-        Encoder(enc_layer[9], enc_layer[10],
+        Encoder_seq(enc_layer[9], enc_layer[10],
                 networks[124], networks[125], networks[126], networks[127],
                 networks[128], networks[129], networks[130], networks[131],
                 networks[132], networks[133], networks[134], networks[135]);
 
-        Encoder(enc_layer[10], enc_layer[11],
+        Encoder_seq(enc_layer[10], enc_layer[11],
                 networks[136], networks[137], networks[138], networks[139],
                 networks[140], networks[141], networks[142], networks[143],
                 networks[144], networks[145], networks[146], networks[147]);
 
-        layer_norm(enc_layer[11], enc_output, networks[148], networks[149]);
+        layer_norm_seq(enc_layer[11], enc_output, networks[148], networks[149]);
 
         /* Token 값 추출 */
         float *cls_token = (float *)malloc(sizeof(float) * embed_dim);
         float *cls_output = (float *)malloc(sizeof(float) * num_classes);
         memcpy(cls_token, enc_output, sizeof(float) * embed_dim);
 
-        linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151]);
+        linear_layer_seq(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151]);
         /* 확률분포 추출 */
-        Softmax(cls_output, probabilities[i], num_classes);
+        Softmax_seq(cls_output, probabilities[i], num_classes);
         printf("picture #%d: %.2f sec\n", i, (double)(clock() - startTime) / CLK_TCK);
     }
 }

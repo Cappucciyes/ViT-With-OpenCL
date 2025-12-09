@@ -39,8 +39,8 @@ __kernel void linear_layer(
             inputTile[li][lj] = 0;
         
         int weightCol= tileStart + lj;
-        if (weightCol < colB && gi < colA) 
-            weightTile[li][lj] = weight[gi * colB + weightCol];
+        if (weightCol < colB && gj < colB) 
+            weightTile[li][lj] = weight[gj * colA+ weightCol];
         else
             weightTile[li][lj] = 0;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -52,7 +52,7 @@ __kernel void linear_layer(
     }
 
     result += bias[gj];
-    if (gi <= rowA && gj <= colB) {
+    if (gi < rowA && gj < colB) {
         if (doGelu == 1)
 			output[gi * colB + gj] = gelu(result);
 		else

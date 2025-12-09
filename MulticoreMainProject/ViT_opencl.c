@@ -8,6 +8,7 @@
 #include <CL/cl.h>
 #include <stdbool.h>
 #include "Network.h"
+#include "ViT_seq.h"
 #include "kernelHandler.h"
 #define img_size 224
 #define patch_size 16
@@ -82,6 +83,7 @@ void printEventProfile();
 void test_linear_layer();
 bool findNaN(float* a, int tokens, int embedings);
 void test_linear_layer_big();
+void testMultihead(Network in_weight, Network in_bias, Network out_weight, Network out_bias);
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
 void Conv2d(float* input, float* output, Network weight, Network bias)
@@ -210,25 +212,6 @@ void pos_emb(float *input, float *output, Network pos_emb)
 void layer_norm(float *input, float *output, Network weight, Network bias)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-    //time_t startTime = clock();
-    /*for (int t = 0; t < tokens; t++)
-    {
-        float sum = 0.0, sum_sq = 0.0;
-        for (int i = 0; i < embed_dim; i++)
-        {
-            float val = input[t * embed_dim + i];
-            sum += val;
-            sum_sq += val * val;
-        }
-        float mean = sum / embed_dim;
-        float var = sum_sq / embed_dim - mean * mean;
-        float inv_std = 1.0f / sqrtf(var + eps);
-        for (int i = 0; i < embed_dim; i++)
-        {
-            int idx = t * embed_dim + i;
-            output[idx] = (input[idx] - mean) * inv_std * weight.data[i] + bias.data[i];
-        }
-    }*/
     cl_int err;
     cl_event writeEvent[3];
     cl_event execEvent;
@@ -458,17 +441,6 @@ void multihead_attn(float *input, float *output,
     //printf("QKV total time: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
-//float gelu(float x)
-//{
-//    return 0.5f * x * (1.0f + erff(x / sqrtf(2.0f)));
-//}
-//void gelu_activation(float *input, float *output, int size)
-//{
-//    for (int i = 0; i < size; i++)
-//    {
-//        output[i] = gelu(input[i]);
-//    }
-//}
 
 void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, Network weight, Network bias, bool doGelu) {
 
@@ -561,7 +533,7 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
     int hidden_dim = ((int)(embed_dim * mlp_ratio));                      // 3072
 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
-	//if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+	if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
     
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true); 
     linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false);
@@ -571,8 +543,9 @@ void mlp_block(float *input, float *output, Network fc1_weight, Network fc1_bias
 
 ////////////////////////////////////// Encoder Architecture //////////////////////////////////////
 void Encoder(float *input, float *output,
-             Network ln1_w, Network ln1_b, Network attn_w, Network attn_b, Network attn_out_w, Network attn_out_b,
-             Network ln2_w, Network ln2_b, Network mlp1_w, Network mlp1_b, Network mlp2_w, Network mlp2_b)
+             Network ln1_w, Network ln1_b, Network attn_w, Network attn_b, 
+             Network attn_out_w, Network attn_out_b, Network ln2_w, Network ln2_b, 
+             Network mlp1_w, Network mlp1_b, Network mlp2_w, Network mlp2_b)
 {
     encoderCount += 1;
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
@@ -762,6 +735,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
     //test_linear_layer();
     //test_linear_layer_big();
+    testMultihead(networks[6], networks[7],
+                networks[8], networks[9]);
     for (int i = 0; i < image->n; i++)
     {
         double startTime = clock();
@@ -835,6 +810,9 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
                 networks[136], networks[137], networks[138], networks[139],
                 networks[140], networks[141], networks[142], networks[143],
                 networks[144], networks[145], networks[146], networks[147]);
+
+        for (int asdf = 0; asdf < 12; asdf += 1)
+            if (findNaN(enc_layer[asdf], 197, embed_dim)) printf("%d has nan", asdf);
          
         layer_norm(enc_layer[11], enc_output, networks[148], networks[149]);
 
@@ -1194,7 +1172,7 @@ void test_linear_layer_big(){
     }
     for (int i = 0; i < 32; i++) {
 		for (int j = 0; j < 32; j++) {
-			weight[i * 32 + j] = 1;
+			weight[i * 32 + j] = i;
 		}
 	}
 
@@ -1214,8 +1192,17 @@ void test_linear_layer_big(){
 
     printf("Output:\n");
     for (int i = 0; i < 17; i++) {
+		for (int j = 0; j < 32; j++) {
+            printf("%.1f ", output[i * 32 + j]);
+		}
+        printf("\n");
+	}
+
+
+
+    for (int i = 0; i < 17; i++) {
         for (int j = 0; j < 32; j++) {
-            if (output[i * 32 + j] != 32) {
+            if (output[i * 32 + j] != 32 * j) {
                 printf("wrong anwer(%f) on %d %d\n", output[i * 32 + j], i, j);
                 return;
             }
@@ -1223,4 +1210,31 @@ void test_linear_layer_big(){
     }
 
     printf("all good!\n");
+}
+
+void testMultihead(Network in_weight, Network in_bias, Network out_weight, Network out_bias) {
+    float *input  = malloc(sizeof(float) * 197* embed_dim);
+    float *output = malloc(sizeof(float) * 197* embed_dim);
+    float *outputAns = malloc(sizeof(float) * 197* embed_dim);
+
+    for (int i = 0; i < 197* embed_dim; i++)
+        input[i] = 0.01f * i;
+
+
+    multihead_attn(input, output, in_weight, in_bias, out_weight, out_bias);
+    multihead_attn_seq(input, outputAns, in_weight, in_bias, out_weight, out_bias);
+    
+    for (int i = 0; i < 197; i++) {
+		for (int j = 0; j < embed_dim; j++) {
+			if (output[i * embed_dim+ j] != outputAns[i * embed_dim+ j]) {
+				printf("wrong anwer(%f, correct: %f) on %d %d\n", output[i * embed_dim + j],outputAns[i * embed_dim + j], i, j);
+				return;
+			}
+		}
+	}
+
+    printf("all good! mth\n");
+    free(input);
+    free(output);
+    free(outputAns);
 }

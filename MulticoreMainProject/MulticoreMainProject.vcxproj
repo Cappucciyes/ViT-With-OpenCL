@@ -25,6 +25,7 @@
     <ClCompile Include="Main.c" />
     <ClCompile Include="Network.c" />
     <ClCompile Include="ViT_opencl.c" />
+    <ClCompile Include="ViT_seq.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="comparator.h" />
@@ -32,6 +33,7 @@
     <ClInclude Include="kernelHandler.h" />
     <ClInclude Include="Network.h" />
     <ClInclude Include="ViT_opencl.h" />
+    <ClInclude Include="ViT_seq.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="conv2d.cl" />

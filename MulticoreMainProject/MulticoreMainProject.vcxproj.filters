@@ -36,6 +36,9 @@
     <ClCompile Include="kernelHandler.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ViT_seq.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ViT_opencl.h">
@@ -51,6 +54,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="kernelHandler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ViT_seq.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
