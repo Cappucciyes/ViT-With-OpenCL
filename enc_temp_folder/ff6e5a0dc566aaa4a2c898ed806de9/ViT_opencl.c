@@ -28,10 +28,6 @@ cl_platform_id PLATFORM;
 cl_device_id DEVICE;
 cl_context CONTEXT;
 
-cl_command_queue WRITE_COMMAND_QUEUE;
-cl_command_queue EXEC_COMMAND_QUEUE;
-cl_command_queue READ_COMMAND_QUEUE;
-
 cl_program MULTIHEAD_PROGRAM;
 cl_kernel QKV_KERNEL;
 cl_kernel QKV_TO_SCOREV_KERNEL;
@@ -141,7 +137,9 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
     CHECK_ERROR(err);
     
     clFinish(CONV2D_QUEUE);
+    printf("asdf\n");
     profileEvents(writeEvent, 3, &CONV_WRITE_TIME);
+    printf("asdfasdf\n");
     profileEvents(&execEvent, 1, &CONV_EXEC_TIME);
     profileEvents(&readEvent, 1, &CONV_READ_TIME);
     CONV_EXEC_COUNT += 1;
@@ -295,11 +293,11 @@ void multihead_attn(float *input, float *output,
 	cl_mem biasBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (embed_dim * 3), NULL, &err);
 	CHECK_ERROR(err);
     
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, 0, NULL, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, &writeEvent[1]);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim * 3), in_weight.data, 0, NULL, &writeEvent[1]);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * 3), in_bias.data, 0, NULL, &writeEvent[2]);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * 3), in_bias.data, 0, NULL, &writeEvent[2]);
 	CHECK_ERROR(err);
 
    	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -331,7 +329,7 @@ void multihead_attn(float *input, float *output,
     //};
     //size_t local_size[] = { 256, 1, 1 };
     err = clEnqueueNDRangeKernel(
-        EXEC_COMMAND_QUEUE,
+        MULTIHEAD_QUEUE,
 		QKV_KERNEL,
 		3,
 		NULL,
@@ -379,7 +377,7 @@ void multihead_attn(float *input, float *output,
 	size_t global_QKV_TO_SCOREV_size[3] = {256 , tokens, num_heads};
 	size_t local_QKV_TO_SCOREV_size[3] = {256, 1, 1};
 	err = clEnqueueNDRangeKernel(
-        EXEC_COMMAND_QUEUE,
+        MULTIHEAD_QUEUE, 
         QKV_TO_SCOREV_KERNEL,
         3, 
         NULL, 
@@ -406,9 +404,9 @@ void multihead_attn(float *input, float *output,
     cl_mem outBiasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
     CHECK_ERROR(err);
 
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, outWeightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * embed_dim), out_weight.data, 1, &execEvent[1], &writeEvent[3]);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, outWeightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * embed_dim), out_weight.data, 1, &execEvent[1], &writeEvent[3]);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, outBiasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, &execEvent[1], &writeEvent[4]);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, outBiasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, &execEvent[1], &writeEvent[4]);
 	CHECK_ERROR(err);
 
     err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outputBuf);
@@ -446,7 +444,7 @@ void multihead_attn(float *input, float *output,
     //};
     //size_t local_LL_size[] = { 1, 1 };
 	err = clEnqueueNDRangeKernel(
-		EXEC_COMMAND_QUEUE, 
+		MULTIHEAD_QUEUE, 
         LL_KERNEL,
 		2, 
 		NULL, 
@@ -456,10 +454,10 @@ void multihead_attn(float *input, float *output,
 		&writeEvent[3], &execEvent[2]);
 	CHECK_ERROR(err); 
 
-	err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
+	err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
 	CHECK_ERROR(err);
 
-    clFinish(READ_COMMAND_QUEUE);
+    clFinish(MULTIHEAD_QUEUE);
     //printf("\n=== Checking final outputs ===\n");
     //printf("outputs [0][0:5]: ");
     //for (int i = 0; i < 5; i++) printf("%f ", output[i]);
@@ -737,14 +735,9 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 		//CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
 		0
 	};
-
-    WRITE_COMMAND_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
-    CHECK_ERROR(err);
-    EXEC_COMMAND_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+	MULTIHEAD_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
 	CHECK_ERROR(err);    
-    READ_COMMAND_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
-    CHECK_ERROR(err);
-
+    
     // for ll
 	kernel_source = get_source_code("ll.cl", &kernel_source_size);
 	LL_PROGRAM = clCreateProgramWithSource(CONTEXT, 1, (const char**)&kernel_source, &kernel_source_size, &err);
@@ -755,6 +748,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
 	LL_KERNEL = clCreateKernel(LL_PROGRAM, "linear_layer", &err);
 	CHECK_ERROR(err);
+	LL_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+    CHECK_ERROR(err);
 
     // for conv2d
     kernel_source = get_source_code("conv2d.cl", &kernel_source_size);
@@ -767,6 +762,8 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     CHECK_ERROR(err);
     CONV2D_KERNEL = clCreateKernel(CONV2D_PROGRAM, "conv2d_kernel", &err);
 	CHECK_ERROR(err);
+    CONV2D_QUEUE = clCreateCommandQueueWithProperties(CONTEXT, DEVICE, props, &err);
+	CHECK_ERROR(err);
     
     // for layer_norm 
 	kernel_source = get_source_code("layer_norm.cl", &kernel_source_size);
@@ -775,7 +772,10 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(clBuildProgram(LAYERNORM_PROGRAM, 1, &DEVICE, "", NULL, NULL));
 	build_error(CONV2D_PROGRAM, DEVICE, err);
 	CHECK_ERROR(err);
-	
+	LAYERNORM_KERNEL= clCreateKernel(LAYERNORM_PROGRAM, "layerNorm", &err);
+	CHECK_ERROR(err);
+	LAYERNORM_QUEUE= clCreateCommandQueueWithProperties(CONTEXT, DEVICE,props, &err);
+	CHECK_ERROR(err);
     printf("setup time: %.6f sec\n\n" , (double)(clock() - setupTime) / CLK_TCK);
     //printSpec();
 
@@ -835,9 +835,10 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     CHECK_ERROR(clReleaseProgram(LL_PROGRAM));
     CHECK_ERROR(clReleaseProgram(CONV2D_PROGRAM));
     CHECK_ERROR(clReleaseProgram(LAYERNORM_PROGRAM));
-	CHECK_ERROR(clReleaseCommandQueue(WRITE_COMMAND_QUEUE));
-    CHECK_ERROR(clReleaseCommandQueue(EXEC_COMMAND_QUEUE));
-    CHECK_ERROR(clReleaseCommandQueue(READ_COMMAND_QUEUE));
+	CHECK_ERROR(clReleaseCommandQueue(MULTIHEAD_QUEUE));
+    CHECK_ERROR(clReleaseCommandQueue(LL_QUEUE));
+    CHECK_ERROR(clReleaseCommandQueue(CONV2D_QUEUE));
+    CHECK_ERROR(clReleaseCommandQueue(LAYERNORM_QUEUE));
 
     err = clReleaseContext(CONTEXT);
     CHECK_ERROR(err);
@@ -964,6 +965,8 @@ void profileEvents(cl_event *events, int eventCount, cl_ulong* timeGlobalVariabl
                                sizeof(cl_ulong), &start, NULL);
         clGetEventProfilingInfo(events[i], CL_PROFILING_COMMAND_END, 
                                sizeof(cl_ulong), &end, NULL);
+
+        if (i == 1 && (minStart <= start && start <= maxEnd)) printf("second pipe! nice\n");
         if (start < minStart) minStart= start;
         if (end > maxEnd) maxEnd= end;
     }
