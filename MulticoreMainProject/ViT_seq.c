@@ -144,9 +144,8 @@ void layer_norm_seq(float *input, float *output, Network weight, Network bias)
 void multihead_attn_seq(float *input, float *output,
                         Network in_weight, Network in_bias, Network out_weight, Network out_bias)
 {
-
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-
+   
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     float *Q = (float *)malloc(sizeof(float) * tokens * embed_dim);
@@ -171,6 +170,16 @@ void multihead_attn_seq(float *input, float *output,
             V[t * embed_dim + i] = sum_v;
         }
     }
+    printf("test running\n");
+    printf("=== Checking QKV_seq outputs ===\n");
+    printf("Q[0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", Q[i]);
+    printf("\nK[0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", K[i]);
+    printf("\nV[0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", V[i]);
+    printf("\n");
+
     int print_tokens = tokens < 5 ? tokens : 5;
     int print_dims = embed_dim < 10 ? embed_dim : 10;
 
@@ -186,7 +195,6 @@ void multihead_attn_seq(float *input, float *output,
 
         // attn_score 저장 공간
         float *scores = (float *)malloc(sizeof(float) * tokens * tokens);
-        float *scores_tmp = (float *)malloc(sizeof(float) * tokens * tokens);
 
         // 각 head에 대해 scaled-dot attn
         for (int i = 0; i < tokens; i++)
@@ -252,7 +260,6 @@ void multihead_attn_seq(float *input, float *output,
         free(scores);
         free(head_out);
     }
-
     free(Q);
     free(K);
     free(V);

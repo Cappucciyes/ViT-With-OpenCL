@@ -17,8 +17,8 @@ int main()
 {
 
     ////////////////////////////////////// Input load //////////////////////////////////////
-    //const char *img_filename = "./Data/input-100.bin";
-    const char *img_filename = "./Data/input-1.bin";
+    const char *img_filename = "./Data/input-100.bin";
+    //const char *img_filename = "./Data/input-1.bin";
     ImageData *images = load_image_data(img_filename);
     if (images == NULL)
         return 1;

@@ -320,8 +320,19 @@ void multihead_attn(float *input, float *output,
     err = clSetKernelArg(QKV_KERNEL, 5, sizeof(cl_int), &middleSize);
 	CHECK_ERROR(err);
 
-    size_t global_size[3] = { 256, embed_dim, 3 };
-    size_t local_size[3] = { 256,1,1 };
+    int tileSize = 16;
+    size_t global_size[] = {
+        ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
+        ((embed_dim + tileSize - 1) / tileSize) * tileSize,
+        3
+    };
+    size_t local_size[] = { tileSize, tileSize, 1 };
+    //    size_t global_size[] = {
+    //    256,        // Round up to multiple of 16
+    //    embed_dim,
+    //    3
+    //};
+    //size_t local_size[] = { 256, 1, 1 };
     err = clEnqueueNDRangeKernel(
         MULTIHEAD_QUEUE,
 		QKV_KERNEL,
@@ -333,8 +344,18 @@ void multihead_attn(float *input, float *output,
 		writeEvent,
 		execEvent); 
     CHECK_ERROR(err);
-    err = clReleaseMemObject(inputBuf);
-    
+    /*clEnqueueReadBuffer(MULTIHEAD_QUEUE, qkvBuf, CL_TRUE, 0,
+        sizeof(float) * tokens * embed_dim * 3, qkv_host, 1, execEvent, NULL);
+
+    printf("=== Checking QKV outputs ===\n");
+    printf("Q[0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", qkv_host[i]);
+    printf("\nK[0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", qkv_host[tokens * embed_dim + i]);
+    printf("\nV[0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", qkv_host[2 * tokens * embed_dim + i]);
+    printf("\n");
+    free(qkv_host);*/
     // --- 
     int print_tokens = tokens < 5 ? tokens : 5;
     int print_dims = embed_dim < 10 ? embed_dim : 10;
@@ -370,22 +391,36 @@ void multihead_attn(float *input, float *output,
         1, 
         execEvent, &execEvent[1]);
     CHECK_ERROR(err);
+
+    /*float* attn_host = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    clEnqueueReadBuffer(MULTIHEAD_QUEUE, attnBuf, CL_TRUE, 0,
+        sizeof(float) * tokens * embed_dim, attn_host, 1, &execEvent[1], NULL);
+
+    printf("\n=== Checking attn outputs ===\n");
+    printf("attn_host [0][0:5]: ");
+    for (int i = 0; i < 5; i++) printf("%f ", attn_host[i]);
+    free(attn_host);
+    printf("\n");*/
     // 최종 선형 프로젝션
     cl_mem outputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
 	CHECK_ERROR(err);
+    cl_mem outWeightBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outBiasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
 
-    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim* embed_dim), out_weight.data, 1, &execEvent[1], &writeEvent[3]);
+    err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, outWeightBuf, CL_FALSE, 0, sizeof(float) * (embed_dim * embed_dim), out_weight.data, 1, &execEvent[1], &writeEvent[3]);
 	CHECK_ERROR(err); 
-	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, &execEvent[1], &writeEvent[4]);
+	err = clEnqueueWriteBuffer(MULTIHEAD_QUEUE, outBiasBuf, CL_FALSE, 0, sizeof(float) * (embed_dim), out_bias.data, 1, &execEvent[1], &writeEvent[4]);
 	CHECK_ERROR(err);
 
     err = clSetKernelArg(LL_KERNEL, 0, sizeof(cl_mem), &outputBuf);
 	CHECK_ERROR(err);
-	err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &weightBuf);
+	err = clSetKernelArg(LL_KERNEL, 1, sizeof(cl_mem), &outWeightBuf);
 	CHECK_ERROR(err);
 	err = clSetKernelArg(LL_KERNEL, 2, sizeof(cl_mem), &attnBuf);
 	CHECK_ERROR(err);
-	err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &biasBuf);
+	err = clSetKernelArg(LL_KERNEL, 3, sizeof(cl_mem), &outBiasBuf);
 	CHECK_ERROR(err);
 
     cl_int rowA= tokens;
@@ -402,16 +437,20 @@ void multihead_attn(float *input, float *output,
     err = clSetKernelArg(LL_KERNEL, 7, sizeof(cl_int), &doGelu);
 	CHECK_ERROR(err);
 
-    int tileSize = 16;
-
+    tileSize = 16;
     size_t global_LL_size[] = {
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
         ((embed_dim + tileSize - 1) / tileSize) * tileSize
     };
     size_t local_LL_size[] = { tileSize, tileSize };
+    //size_t global_LL_size[] = {
+    //    tokens,        // Round up to multiple of 16
+    //    embed_dim
+    //};
+    //size_t local_LL_size[] = { 1, 1 };
 	err = clEnqueueNDRangeKernel(
 		MULTIHEAD_QUEUE, 
-		LL_KERNEL,
+        LL_KERNEL,
 		2, 
 		NULL, 
 		global_LL_size, 
@@ -423,8 +462,11 @@ void multihead_attn(float *input, float *output,
 	err = clEnqueueReadBuffer(MULTIHEAD_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
 	CHECK_ERROR(err);
 
-    //clWaitForEvents(1, &readEvent);
     clFinish(MULTIHEAD_QUEUE);
+    //printf("\n=== Checking final outputs ===\n");
+    //printf("outputs [0][0:5]: ");
+    //for (int i = 0; i < 5; i++) printf("%f ", output[i]);
+    //printf("\n");
     profileEvents(writeEvent, 3, &QKV_WRITE_TIME);
     profileEvents(writeEvent + 3, 2, &QKV_WRITE_TIME);
     profileEvents(execEvent, 1, &QKV_EXEC_TIME);
@@ -432,8 +474,11 @@ void multihead_attn(float *input, float *output,
     profileEvents(execEvent + 2, 1, &QKV_FINAL_LL_EXEC_TIME);
     profileEvents(&readEvent, 1, &QKV_READ_TIME);
 
+    err = clReleaseMemObject(inputBuf);
     err = clReleaseMemObject(weightBuf);
     err = clReleaseMemObject(biasBuf);
+    err = clReleaseMemObject(outWeightBuf);
+    err = clReleaseMemObject(outBiasBuf);
     clReleaseMemObject(attnBuf);
     clReleaseMemObject(qkvBuf);
     free(attn_output);
@@ -493,8 +538,12 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
         ((out_features + tileSize - 1) / tileSize) * tileSize
     };
-
-    size_t local_size[] = {tileSize, tileSize};  // Must match TILE_SIZE
+    size_t local_size[] = { tileSize, tileSize };  // Must match TILE_SIZE
+    //size_t global_size[] = {
+    //    tokens,        // Round up to multiple of 16
+    //    out_features
+    //};
+    //size_t local_size[] = {1, 1};  // Must match TILE_SIZE
 	err = clEnqueueNDRangeKernel(
 		LL_QUEUE,
 		LL_KERNEL,
@@ -548,6 +597,7 @@ void Encoder(float *input, float *output,
              Network mlp1_w, Network mlp1_b, Network mlp2_w, Network mlp2_b)
 {
     encoderCount += 1;
+
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
 	if (ln1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
@@ -684,6 +734,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
     QKV_TO_SCOREV_KERNEL = clCreateKernel(MULTIHEAD_PROGRAM, "QKV_TO_SCOREV", &err);
     CHECK_ERROR(err);
 
+
 	cl_queue_properties props[] = {
 		CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE,
 		//CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
@@ -735,8 +786,6 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
     //test_linear_layer();
     //test_linear_layer_big();
-    testMultihead(networks[6], networks[7],
-                networks[8], networks[9]);
     for (int i = 0; i < image->n; i++)
     {
         double startTime = clock();
@@ -749,67 +798,18 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
         /*position embedding*/
         pos_emb(layer[2], layer[3], networks[3]); 
         printf("pre-processing : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
-
         /*Encoder - 12 Layers*/
         Encoder(layer[3], enc_layer[0],
-                networks[4], networks[5], networks[6], networks[7],
-                networks[8], networks[9], networks[10], networks[11],
-                networks[12], networks[13], networks[14], networks[15]);
+            networks[4], networks[5], networks[6], networks[7],
+            networks[8], networks[9], networks[10], networks[11],
+            networks[12], networks[13], networks[14], networks[15]);
 
-        Encoder(enc_layer[0], enc_layer[1],
-                networks[16], networks[17], networks[18], networks[19],
-                networks[20], networks[21], networks[22], networks[23],
-                networks[24], networks[25], networks[26], networks[27]);
-
-        Encoder(enc_layer[1], enc_layer[2],
-                networks[28], networks[29], networks[30], networks[31],
-                networks[32], networks[33], networks[34], networks[35],
-                networks[36], networks[37], networks[38], networks[39]);
-
-        Encoder(enc_layer[2], enc_layer[3],
-                networks[40], networks[41], networks[42], networks[43],
-                networks[44], networks[45], networks[46], networks[47],
-                networks[48], networks[49], networks[50], networks[51]);
-
-        Encoder(enc_layer[3], enc_layer[4],
-                networks[52], networks[53], networks[54], networks[55],
-                networks[56], networks[57], networks[58], networks[59],
-                networks[60], networks[61], networks[62], networks[63]);
-
-        Encoder(enc_layer[4], enc_layer[5],
-                networks[64], networks[65], networks[66], networks[67],
-                networks[68], networks[69], networks[70], networks[71],
-                networks[72], networks[73], networks[74], networks[75]);
-
-        Encoder(enc_layer[5], enc_layer[6],
-                networks[76], networks[77], networks[78], networks[79],
-                networks[80], networks[81], networks[82], networks[83],
-                networks[84], networks[85], networks[86], networks[87]);
-
-        Encoder(enc_layer[6], enc_layer[7],
-                networks[88], networks[89], networks[90], networks[91],
-                networks[92], networks[93], networks[94], networks[95],
-                networks[96], networks[97], networks[98], networks[99]);
-
-        Encoder(enc_layer[7], enc_layer[8],
-                networks[100], networks[101], networks[102], networks[103],
-                networks[104], networks[105], networks[106], networks[107],
-                networks[108], networks[109], networks[110], networks[111]);
-
-        Encoder(enc_layer[8], enc_layer[9],
-                networks[112], networks[113], networks[114], networks[115],
-                networks[116], networks[117], networks[118], networks[119],
-                networks[120], networks[121], networks[122], networks[123]);
-
-        Encoder(enc_layer[9], enc_layer[10],
-                networks[124], networks[125], networks[126], networks[127],
-                networks[128], networks[129], networks[130], networks[131],
-                networks[132], networks[133], networks[134], networks[135]);
-
-        Encoder(enc_layer[10], enc_layer[11],
-                networks[136], networks[137], networks[138], networks[139],
-                networks[140], networks[141], networks[142], networks[143],
-                networks[144], networks[145], networks[146], networks[147]);
+        for (int j = 1; j < 12; j++) {
+            Encoder(enc_layer[j - 1], enc_layer[j],
+                networks[4 + j * 12], networks[5 + j * 12], networks[6 + j * 12], networks[7 + j * 12],
+                networks[8 + j * 12], networks[9 + j * 12], networks[10 + j * 12], networks[11 + j * 12],
+                networks[12 + j * 12], networks[13 + j * 12], networks[14 + j * 12], networks[15 + j * 12]);
+        }
 
         for (int asdf = 0; asdf < 12; asdf += 1)
             if (findNaN(enc_layer[asdf], 197, embed_dim)) printf("%d has nan", asdf);
@@ -829,7 +829,7 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 
         printf("picture #%d: %.6f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
     }
-    //printEventProfile();
+    printEventProfile();
 
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
@@ -1210,31 +1210,4 @@ void test_linear_layer_big(){
     }
 
     printf("all good!\n");
-}
-
-void testMultihead(Network in_weight, Network in_bias, Network out_weight, Network out_bias) {
-    float *input  = malloc(sizeof(float) * 197* embed_dim);
-    float *output = malloc(sizeof(float) * 197* embed_dim);
-    float *outputAns = malloc(sizeof(float) * 197* embed_dim);
-
-    for (int i = 0; i < 197* embed_dim; i++)
-        input[i] = 0.01f * i;
-
-
-    multihead_attn(input, output, in_weight, in_bias, out_weight, out_bias);
-    multihead_attn_seq(input, outputAns, in_weight, in_bias, out_weight, out_bias);
-    
-    for (int i = 0; i < 197; i++) {
-		for (int j = 0; j < embed_dim; j++) {
-			if (output[i * embed_dim+ j] != outputAns[i * embed_dim+ j]) {
-				printf("wrong anwer(%f, correct: %f) on %d %d\n", output[i * embed_dim + j],outputAns[i * embed_dim + j], i, j);
-				return;
-			}
-		}
-	}
-
-    printf("all good! mth\n");
-    free(input);
-    free(output);
-    free(outputAns);
 }

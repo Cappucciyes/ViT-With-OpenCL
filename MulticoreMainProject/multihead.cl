@@ -1,4 +1,6 @@
-﻿__kernel void QKV(
+﻿#define TILESIZE 16
+
+__kernel void QKV(
     __global float* input,
     __global float* weight,
     __global float* outputBundle,
@@ -6,23 +8,59 @@
     int rowSize,
     int embed_dim
 ) {
-    int i = get_global_id(0);
-    int j = get_global_id(1);
+    int tilei = get_group_id(0);
+    int tilej = get_group_id(1);
     int k = get_global_id(2);
-    if (i >= rowSize) return;
+
+    int li = get_local_id(0);
+    int lj = get_local_id(1);
+
+    int gi = tilei * TILESIZE + li;
+    int gj = tilej * TILESIZE + lj;
+    //if (gi >= rowSize|| gj >= embed_dim) return;
     int outputOffset = k * rowSize * embed_dim;
     int currentOffset = k * embed_dim;
+    __local float inputTile[TILESIZE][TILESIZE];
+    __local float weightTile[TILESIZE][TILESIZE];
 
-    int totalWeightCols = 3 * embed_dim;
+    float result = 0;
+    // 타일 수 = 전체 크기를 타일 크기로 나눈 값의 올림.
+    int tileCount = (embed_dim + TILESIZE - 1) / TILESIZE;
+    for (int tile = 0; tile < tileCount; tile++) {
+        int tileStart = tile * TILESIZE;
 
-    float result = bias[j + currentOffset];
-    for (int m = 0; m < embed_dim; m ++) {
-        result += input[i*embed_dim + m] * weight[(j + currentOffset) * embed_dim + m];
+        // Load input tile: input[gi][tileStart + lj]
+        int inputCol = tileStart + lj;
+        if (gi < rowSize && inputCol < embed_dim) {
+            inputTile[li][lj] = input[gi * embed_dim + inputCol];
+        }
+        else {
+            inputTile[li][lj] = 0.0f;
+        }
+
+        int weightCol = tileStart + li;
+        if (gj < embed_dim && weightCol < embed_dim) {
+            weightTile[li][lj] = weight[(gj + currentOffset) * embed_dim + weightCol];
+        }
+        else {
+            weightTile[li][lj] = 0.0f;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Compute partial dot product
+        for (int k = 0; k < TILESIZE; k++) {
+            result += inputTile[li][k] * weightTile[k][lj];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    
-	outputBundle[outputOffset + i * embed_dim + j] = result;
-}
 
+    if (gi < rowSize && gj < embed_dim) {
+        result += bias[currentOffset + gj];
+        outputBundle[outputOffset + gi * embed_dim + gj] = result;
+    }
+}
 
 __kernel void QKV_TO_SCOREV(
     __global float* QKV,
@@ -43,7 +81,7 @@ __kernel void QKV_TO_SCOREV(
     __local float score_local[256];
     __local float maxReduce[256];
     __local float toReduce[256];
-
+    if (t >= tokens || h >= num_heads) return;
     
     // Compute Q·K scores for this token t and head h
     if (localIndex < tokens) {
