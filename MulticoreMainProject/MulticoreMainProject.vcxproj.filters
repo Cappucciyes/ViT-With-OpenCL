@@ -73,5 +73,6 @@
     <None Include="layer_norm.cl">
       <Filter>Source Files\kernels</Filter>
     </None>
+    <None Include="miniSoftMax.cl" />
   </ItemGroup>
 </Project>

@@ -34,3 +34,47 @@ __kernel void conv2d_kernel(
 
     output[(oc * output_size + oh) * output_size + ow] = sum;
 }
+
+
+__kernel void postprocess(
+    __global const float* conv_out,      // [embed_dim, output_size, output_size]
+    __global const float* class_token,   // [embed_dim]
+    __global const float* pos_embed,     // [(num_patches+1)*embed_dim]
+    __global float* final_tokens,         // [(num_patches+1)*embed_dim]
+    int img_size,
+    int patch_size,
+    int embed_dim
+)
+{
+    const int output_size = img_size / patch_size;
+    const int num_patches = output_size * output_size;
+    const int total_tokens = num_patches + 1;
+
+    int gid = get_global_id(0);
+    int total = total_tokens * embed_dim;
+    if (gid >= total) return;
+
+    int token_idx = gid / embed_dim;
+    int oc = gid % embed_dim;
+
+    float val;
+
+    if (token_idx == 0) {
+        // class token
+        val = class_token[oc];
+    }
+    else {
+        // flatten + transpose from conv_out
+        int patch_idx = token_idx - 1;
+        int oh = patch_idx / output_size;
+        int ow = patch_idx % output_size;
+
+        int conv_idx = (oc * output_size + oh) * output_size + ow;
+        val = conv_out[conv_idx];
+    }
+
+    // positional embedding add
+    val += pos_embed[gid];
+
+    final_tokens[gid] = val;
+}

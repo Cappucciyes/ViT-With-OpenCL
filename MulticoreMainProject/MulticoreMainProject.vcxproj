@@ -39,6 +39,7 @@
     <None Include="conv2d.cl" />
     <None Include="layer_norm.cl" />
     <None Include="ll.cl" />
+    <None Include="miniSoftMax.cl" />
     <None Include="multihead.cl" />
   </ItemGroup>
   <PropertyGroup Label="Globals">

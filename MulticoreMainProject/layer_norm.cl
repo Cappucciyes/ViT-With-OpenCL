@@ -51,3 +51,15 @@ __kernel void layerNorm(
 	float normalized = (input[index] - mean) * inv_std;
 	output[index] = normalized * weight[d] + bias[d];
 }
+
+__kernel void encoderResidual(
+	__global float* input,
+	__global float* toAdd,
+	__global float* output
+) {
+	int i = get_global_id(0);
+	int j = get_global_id(1);
+	int colSize = get_global_size(1);
+
+	output[i * colSize + j] =input[i * colSize + j] +  toAdd[i * colSize + j];
+}
