@@ -24,19 +24,61 @@
 #define eps 1e-6
 
 typedef struct {
+    cl_mem ln_w, ln_b;
+    cl_mem mlp_w, mlp_b;
+} FinalWeight;
+
+#define MAX_IMAGES_IN_FLIGHT 12  // Process up to 3 images concurrently
+#define ENCODER_PIPELINE_DEPTH 3  // Triple buffering for encoder weights
+
+typedef struct {
     cl_mem ln1_w, ln1_b;
     cl_mem attn_w, attn_b;
     cl_mem attn_out_w, attn_out_b;
     cl_mem ln2_w, ln2_b;
     cl_mem mlp1_w, mlp1_b;
     cl_mem mlp2_w, mlp2_b;
+    cl_event writeComplete;
 } EncoderWeights;
 
 typedef struct {
-    cl_mem ln_w, ln_b;
-    cl_mem mlp_w, mlp_b;
-} FinalWeight;
+    // Input/output data
+    float* layer[4];           // Pre-processing layers
+    float* enc_layer[13];      // Encoder layers
+    float* enc_output;
+    float* cls_token;
+    float* cls_output;
 
+    // GPU buffers (persistent across encoders)
+    cl_mem input_buf;
+    cl_mem output_buf;
+    cl_mem qkv_buf;
+    cl_mem attn_buf;
+    cl_mem fc1_buf;
+
+    // Events for synchronizations
+    cl_event preprocessComplete;
+    cl_event encoderComplete[12];
+    cl_event finalComplete;
+
+    // Status
+    int image_idx;
+    int current_encoder;
+    bool processing;
+} ImagePipelineState;
+
+typedef struct {
+    EncoderWeights weights[ENCODER_PIPELINE_DEPTH];
+    int next_load_idx;
+    cl_event loadComplete[ENCODER_PIPELINE_DEPTH];
+} WeightPipelineState;
+
+typedef struct {
+    cl_mem* buffers;        // Array of buffers to release
+    int num_buffers;
+    cl_event* events;       // Array of events to release
+    int num_events;
+} CleanupContext;
 
 // Global Variable
 cl_platform_id PLATFORM;
@@ -89,26 +131,301 @@ double totalResidualTime;
 
 cl_event ENCODER_FLAGS[12 * 5 + 1]; //(layernorm, multihead, layer norm, ll ,ll) * 12 
 cl_event FINAL_FLAG[2]; //(layernorm, ll) * 12 
-
-
 ////////////////////////////////////// utils function //////////////////////////////////////
-void printSpec();
 void profileEvents(cl_event* events, int eventCount, cl_ulong* timeGlobalVariable);
-EncoderWeights initEncoderWeight();
-void fillEncoderWeight(EncoderWeights weights, Network* networkList, int encoderIndex, cl_command_queue writingPipe, cl_event* writeEvents);
-void releaseEncoderWeights(EncoderWeights weights);
-FinalWeight initFinalWeight(Network* networkList);
-void fillFinalWeight(FinalWeight weights, Network* networkList);
-void releaseFinalWeights(FinalWeight weights);
 
 // testing 
 void printEventProfile();
 //void test_linear_layer();
 bool findNaN(float* a, int tokens, int embedings);
 //void test_linear_layer_big();
+ 
+////pipeline
+ImagePipelineState* createImagePipelineState(int image_idx) {
+    ImagePipelineState* state = (ImagePipelineState*)malloc(sizeof(ImagePipelineState));
+    cl_int err;
+    int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
+    int hidden_dim = ((int)(embed_dim * mlp_ratio));
+
+    // Allocate CPU buffers
+    for (int i = 0; i < 4; i++) {
+        state->layer[i] = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    }
+    for (int i = 0; i < 13; i++) {
+        state->enc_layer[i] = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    }
+    state->enc_output = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    state->cls_token = (float*)malloc(sizeof(float) * embed_dim);
+    state->cls_output = (float*)malloc(sizeof(float) * num_classes);
+
+    // Allocate persistent GPU buffers (reused across encoders)
+    state->input_buf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE,
+        sizeof(float) * tokens * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    state->output_buf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE,
+        sizeof(float) * tokens * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    state->qkv_buf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE,
+        sizeof(float) * tokens * embed_dim * 3, NULL, &err);
+    CHECK_ERROR(err);
+    state->attn_buf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE,
+        sizeof(float) * tokens * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    state->fc1_buf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE,
+        sizeof(float) * tokens * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+
+    state->image_idx = image_idx;
+    state->current_encoder = 0;
+    state->processing = false;
+
+    return state;
+}
+
+void releaseImagePipelineState(ImagePipelineState* state) {
+    for (int i = 0; i < 4; i++) free(state->layer[i]);
+    for (int i = 0; i < 13; i++) free(state->enc_layer[i]);
+    free(state->enc_output);
+    free(state->cls_token);
+    free(state->cls_output);
+
+    clReleaseMemObject(state->input_buf);
+    clReleaseMemObject(state->output_buf);
+    clReleaseMemObject(state->qkv_buf);
+    clReleaseMemObject(state->attn_buf);
+    clReleaseMemObject(state->fc1_buf);
+
+    free(state);
+}
+
+EncoderWeights initEncoderWeightPipelined() {
+    EncoderWeights weights;
+    cl_int err;
+    int hidden_dim = ((int)(embed_dim * mlp_ratio));
+
+    weights.ln1_w = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln1_b = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_w = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim * embed_dim * 3, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_b = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim * 3, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_out_w = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.attn_out_b = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln2_w = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln2_b = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp1_w = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp1_b = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp2_w = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim * hidden_dim, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp2_b = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY,
+        sizeof(float) * embed_dim, NULL, &err);
+    CHECK_ERROR(err);
+
+    return weights;
+}
+
+void fillEncoderWeightAsync(EncoderWeights* weights, Network* networkList,
+    int encoderIndex, cl_event* waitEvents, int numWaitEvents) {
+    cl_int err;
+    int base = 4 + encoderIndex * 12;
+    cl_event writeEvents[12];
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->ln1_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base].size, networkList[base].data,
+        numWaitEvents, waitEvents, &writeEvents[0]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->ln1_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 1].size, networkList[base + 1].data,
+        numWaitEvents, waitEvents, &writeEvents[1]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->attn_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 2].size, networkList[base + 2].data,
+        numWaitEvents, waitEvents, &writeEvents[2]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->attn_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 3].size, networkList[base + 3].data,
+        numWaitEvents, waitEvents, &writeEvents[3]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->attn_out_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 4].size, networkList[base + 4].data,
+        numWaitEvents, waitEvents, &writeEvents[4]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->attn_out_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 5].size, networkList[base + 5].data,
+        numWaitEvents, waitEvents, &writeEvents[5]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->ln2_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 6].size, networkList[base + 6].data,
+        numWaitEvents, waitEvents, &writeEvents[6]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->ln2_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 7].size, networkList[base + 7].data,
+        numWaitEvents, waitEvents, &writeEvents[7]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->mlp1_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 8].size, networkList[base + 8].data,
+        numWaitEvents, waitEvents, &writeEvents[8]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->mlp1_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 9].size, networkList[base + 9].data,
+        numWaitEvents, waitEvents, &writeEvents[9]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->mlp2_w, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 10].size, networkList[base + 10].data,
+        numWaitEvents, waitEvents, &writeEvents[10]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights->mlp2_b, CL_FALSE, 0,
+        sizeof(float) * networkList[base + 11].size, networkList[base + 11].data,
+        numWaitEvents, waitEvents, &writeEvents[11]);
+    CHECK_ERROR(err);
+
+    err = clEnqueueBarrierWithWaitList(WRITE_COMMAND_QUEUE, 12, writeEvents,
+        &weights->writeComplete);
+    CHECK_ERROR(err);
+
+    for (int i = 0; i < 12; i++) {
+        clReleaseEvent(writeEvents[i]);
+    }
+}
+
+
+void releaseEncoderWeightsPipelined(EncoderWeights* weights) {
+    if (weights->writeComplete) clReleaseEvent(weights->writeComplete);
+    clReleaseMemObject(weights->ln1_w);
+    clReleaseMemObject(weights->ln1_b);
+    clReleaseMemObject(weights->attn_w);
+    clReleaseMemObject(weights->attn_b);
+    clReleaseMemObject(weights->attn_out_w);
+    clReleaseMemObject(weights->attn_out_b);
+    clReleaseMemObject(weights->ln2_w);
+    clReleaseMemObject(weights->ln2_b);
+    clReleaseMemObject(weights->mlp1_w);
+    clReleaseMemObject(weights->mlp1_b);
+    clReleaseMemObject(weights->mlp2_w);
+    clReleaseMemObject(weights->mlp2_b);
+}
+
+void CL_CALLBACK cleanupCallback(cl_event event, cl_int event_status, void* user_data) {
+    CleanupContext* ctx = (CleanupContext*)user_data;
+
+    if (event_status != CL_COMPLETE) {
+        printf("Warning: Event completed with status %d\n", event_status);
+    }
+
+    // Release all buffers
+    for (int i = 0; i < ctx->num_buffers; i++) {
+        if (ctx->buffers[i] != NULL) {
+            clReleaseMemObject(ctx->buffers[i]);
+        }
+    }
+
+    // Release all events
+    for (int i = 0; i < ctx->num_events; i++) {
+        if (ctx->events[i] != NULL) {
+            clReleaseEvent(ctx->events[i]);
+        }
+    }
+
+    // Free the context itself
+    free(ctx->buffers);
+    free(ctx->events);
+    free(ctx);
+}
+
+void registerCleanup(cl_event completion_event, cl_mem* buffers, int num_buffers,
+    cl_event* events, int num_events) {
+    // Allocate cleanup context
+    CleanupContext* ctx = (CleanupContext*)malloc(sizeof(CleanupContext));
+
+    ctx->num_buffers = num_buffers;
+    ctx->buffers = (cl_mem*)malloc(sizeof(cl_mem) * num_buffers);
+    for (int i = 0; i < num_buffers; i++) {
+        ctx->buffers[i] = buffers[i];
+    }
+
+    ctx->num_events = num_events;
+    ctx->events = (cl_event*)malloc(sizeof(cl_event) * num_events);
+    for (int i = 0; i < num_events; i++) {
+        ctx->events[i] = events[i];
+    }
+
+    // Register callback - OpenCL will call cleanupCallback when event completes
+    cl_int err = clSetEventCallback(completion_event, CL_COMPLETE,
+        cleanupCallback, ctx);
+    CHECK_ERROR(err);
+}
+
+FinalWeight initFinalWeight(Network* networkList) {
+    FinalWeight weights;
+    cl_int err;
+
+    weights.ln_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[148].size, NULL, &err);
+    CHECK_ERROR(err);
+    weights.ln_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[149].size, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[150].size, NULL, &err);
+    CHECK_ERROR(err);
+    weights.mlp_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[151].size, NULL, &err);
+    CHECK_ERROR(err);
+
+    return weights;
+}
+
+void fillFinalWeight(FinalWeight weights, Network* networkList) {
+    cl_int err;
+
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln_w, CL_FALSE, 0, sizeof(float) * networkList[148].size, networkList[148].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln_b, CL_FALSE, 0, sizeof(float) * networkList[149].size, networkList[149].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp_w, CL_FALSE, 0, sizeof(float) * networkList[150].size, networkList[150].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp_b, CL_FALSE, 0, sizeof(float) * networkList[151].size, networkList[151].data, 0, NULL, NULL);
+    CHECK_ERROR(err);
+
+    clFinish(WRITE_COMMAND_QUEUE);
+}
+
+void releaseFinalWeights(FinalWeight weights) {
+    clReleaseMemObject(weights.ln_w);
+    clReleaseMemObject(weights.ln_b);
+    clReleaseMemObject(weights.mlp_w);
+    clReleaseMemObject(weights.mlp_b);
+}
+
 ////////////////////////////////////// ViT function //////////////////////////////////////
 
-void Conv2d(float* input, float* output, Network weight, Network bias)
+void Conv2d(float* input, float* output, Network weight, Network bias, cl_event* waitEvents, int numWaitEvents, cl_event* complete)
 {
     int output_size = img_size / patch_size;
     cl_int err;
@@ -125,11 +442,11 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
     cl_mem biasBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_ONLY, sizeof(float) * embed_dim, NULL, &err);
     CHECK_ERROR(err);
 
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * img_size * img_size * in_chans, input, 0, NULL, writeEvent);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * img_size * img_size * in_chans, input, numWaitEvents, waitEvents, writeEvent);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * embed_dim * embed_dim, weight.data, 0, NULL, writeEvent + 1);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weightBuf, CL_FALSE, 0, sizeof(float) * embed_dim * embed_dim, weight.data, numWaitEvents, waitEvents, writeEvent + 1);
     CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * embed_dim, bias.data, 0, NULL, writeEvent + 2);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, biasBuf, CL_FALSE, 0, sizeof(float) * embed_dim, bias.data, numWaitEvents, waitEvents, writeEvent + 2);
     CHECK_ERROR(err);
 
     err = clSetKernelArg(CONV2D_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -164,17 +481,16 @@ void Conv2d(float* input, float* output, Network weight, Network bias)
         sizeof(float) * embed_dim * output_size * output_size,
         output, 1, &execEvent, &readEvent);
     CHECK_ERROR(err);
-    
-    clFinish(READ_COMMAND_QUEUE);
     //profileEvents(writeEvent, 3, &CONV_WRITE_TIME);
     //profileEvents(&execEvent, 1, &CONV_EXEC_TIME);
     //profileEvents(&readEvent, 1, &CONV_READ_TIME);
-    CONV_EXEC_COUNT += 1;
 
-    clReleaseMemObject(inputBuf);
-    clReleaseMemObject(outputBuf);
-    clReleaseMemObject(weightBuf);
-    clReleaseMemObject(biasBuf);
+    *complete = readEvent;
+
+    // Register automatic cleanup when readEvent completes
+    cl_mem buffers_to_cleanup[] = { inputBuf, outputBuf, weightBuf, biasBuf };
+    cl_event events_to_cleanup[] = { writeEvent[0], writeEvent[1], writeEvent[2], execEvent };
+    registerCleanup(readEvent, buffers_to_cleanup, 4, events_to_cleanup, 4);
 }
 
 void flatten_transpose(float *input, float *output)
@@ -231,18 +547,40 @@ void pos_emb(float *input, float *output, Network pos_emb)
     }
 }
 
+void preprocessImageAsync(ImageData* image, ImagePipelineState* state,
+    Network* networks, cl_event* complete) {
+    // Conv2D
+    Conv2d(image->data, state->layer[0], networks[1], networks[2],
+        NULL, 0, complete);
+
+    // Wait for Conv2D, then do CPU operations
+    clWaitForEvents(1, complete);
+
+    // Flatten transpose (CPU)
+    flatten_transpose(state->layer[0], state->layer[1]);
+
+    // Class token (CPU)
+    class_token(state->layer[1], state->layer[2], networks[0]);
+
+    // Position embedding (CPU)
+    pos_emb(state->layer[2], state->enc_layer[0], networks[3]);
+
+    state->preprocessComplete = *complete;
+}
+
 void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias, cl_event* flagEvents, int flagCount, cl_event* nextFlag)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     cl_int err;
-    cl_event writeEvent[1];
+    cl_event writeEvent;
     cl_event execEvent;
+    cl_event readEvent;
     cl_mem inputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
     cl_mem outputbuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
     
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, flagCount, flagEvents, writeEvent);
+	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, flagCount, flagEvents, &writeEvent);
 	CHECK_ERROR(err);
     
     err = clSetKernelArg(LAYERNORM_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -270,41 +608,45 @@ void layer_norm(float *input, float *output, cl_mem weight, cl_mem bias, cl_even
 		globalSize,
 		localSize,
 		1,
-		writeEvent,
+		&writeEvent,
 		&execEvent);
 	CHECK_ERROR(err);
-    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, nextFlag);
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputbuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent, &readEvent);
     CHECK_ERROR(err);
-
+    
     /*profileEvents(writeEvent, 1, &LAYERNORM_WRITE_TIME);
 	profileEvents(&execEvent, 1, &LAYERNORM_EXEC_TIME);
 	profileEvents(&readEvent, 1, &LAYERNORM_READ_TIME);*/
 	LAYERNORM_EXEC_COUNT += 1;
+    *nextFlag = readEvent;
 
-    clReleaseMemObject(inputBuf);
-    clReleaseMemObject(outputbuf);
+    cl_mem buffers_to_cleanup[] = { inputBuf, outputbuf };
+    cl_event events_to_cleanup[] = { writeEvent, execEvent };
+    registerCleanup(readEvent, buffers_to_cleanup, 2, events_to_cleanup, 2);
     //printf("Layer Normalization: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 
 }
 
 void multihead_attn(float *input, float *output,
-                    cl_mem in_weight, cl_mem in_bias, cl_mem out_weight, cl_mem out_bias, cl_event* flagEvent, int flagCount, cl_event* nextFlag)
+                    cl_mem in_weight, cl_mem in_bias, cl_mem out_weight, cl_mem out_bias,
+                    cl_mem qkvBuf, cl_mem attnBuf,
+                    cl_event* flagEvent, int flagCount, cl_event* nextFlag)
 {
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     cl_int err;
-    cl_event writeEvent[5];
+    cl_event writeEvent;
     cl_event execEvent[3];
     cl_event readEvent;
 
 	//clock_t startTime = clock();
     cl_mem inputBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim), NULL, &err);
 	CHECK_ERROR(err);
-    cl_mem qkvBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim * 3), NULL, &err);
-	CHECK_ERROR(err);
+ //   cl_mem qkvBuf= clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * embed_dim * 3), NULL, &err);
+	//CHECK_ERROR(err);
     
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, flagCount, flagEvent, writeEvent);
+    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, inputBuf, CL_FALSE, 0, sizeof(float) * (tokens * embed_dim), input, flagCount, flagEvent, &writeEvent);
     CHECK_ERROR(err);
 
    	err = clSetKernelArg(QKV_KERNEL, 0, sizeof(cl_mem), &inputBuf);
@@ -343,7 +685,7 @@ void multihead_attn(float *input, float *output,
 		global_size,
 		local_size,
 		1,
-		writeEvent,
+		&writeEvent,
 		execEvent); 
     CHECK_ERROR(err);
     // --- 
@@ -352,8 +694,8 @@ void multihead_attn(float *input, float *output,
 
     /*Attn 결과를 저장할 버퍼*/
     float *attn_output = (float *)malloc(sizeof(float) * tokens * embed_dim);
-	cl_mem attnBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
-	CHECK_ERROR(err);
+	//cl_mem attnBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * tokens * embed_dim, NULL, &err);
+	//CHECK_ERROR(err);
 	err = clSetKernelArg(QKV_TO_SCOREV_KERNEL, 0, sizeof(cl_mem), &qkvBuf);
 	CHECK_ERROR(err);
 	err = clSetKernelArg(QKV_TO_SCOREV_KERNEL, 1, sizeof(cl_mem), &attnBuf);
@@ -427,25 +769,18 @@ void multihead_attn(float *input, float *output,
 		&execEvent[1], &execEvent[2]);
 	CHECK_ERROR(err); 
 
-	err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], nextFlag);
+	err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outputBuf, CL_FALSE, 0, sizeof(float) * tokens * embed_dim, output, 1, &execEvent[2], &readEvent);
 	CHECK_ERROR(err);
 
-    clFinish(READ_COMMAND_QUEUE);
-
-    //profileEvents(writeEvent, 1, &QKV_WRITE_TIME);
-    //profileEvents(execEvent, 1, &QKV_EXEC_TIME);
-    //profileEvents(execEvent + 1, 1, &QKV_TO_SCORE_EXEC_TIME);
-    //profileEvents(execEvent + 2, 1, &QKV_FINAL_LL_EXEC_TIME);
-    //profileEvents(&readEvent, 1, &QKV_READ_TIME);
-
-    err = clReleaseMemObject(inputBuf);
-    clReleaseMemObject(attnBuf);
-    clReleaseMemObject(qkvBuf);
-    free(attn_output);
     QKV_EXEC_COUNT += 1;
+    *nextFlag = readEvent;
+
+    cl_mem buffers_to_cleanup[] = { inputBuf, outputBuf };
+    cl_event events_to_cleanup[] = { writeEvent, execEvent[0], execEvent[1], execEvent[2] };
+    registerCleanup(readEvent, buffers_to_cleanup, 2, events_to_cleanup, 4);
+
     //printf("QKV total time: %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
-
 
 void linear_layer(float* input, float* output, int tokens, int in_features, int out_features, cl_mem weight, cl_mem bias, bool doGelu,
                     cl_event* flagEvent, int flagCount, cl_event* nextFlag) {
@@ -454,6 +789,7 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
     cl_int err;
     cl_event writeEvent;
     cl_event execEvent;
+    cl_event readEvent;
 	cl_mem outBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * out_features), NULL, &err);
     CHECK_ERROR(err);
     cl_mem inputBuf = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * (tokens * in_features), NULL, &err);
@@ -503,22 +839,26 @@ void linear_layer(float* input, float* output, int tokens, int in_features, int 
 		&execEvent);
     CHECK_ERROR(err);
     
-    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, nextFlag);
-	CHECK_ERROR(err); 
-    clFinish(READ_COMMAND_QUEUE); 
+    err = clEnqueueReadBuffer(READ_COMMAND_QUEUE, outBuf, CL_FALSE, 0, sizeof(float) * (tokens * out_features), output, 1, &execEvent, &readEvent);
+	CHECK_ERROR(err);  
 
     //profileEvents(&writeEvent, 1, &LL_WRITE_TIME);
     //profileEvents(&execEvent, 1, &LL_EXEC_TIME);
     //profileEvents(&readEvent, 1, &LL_READ_TIME);
     LL_EXEC_COUNT += 1;
-	err = clReleaseMemObject(outBuf);
-	CHECK_ERROR(err); 
-    err = clReleaseMemObject(inputBuf);
-	CHECK_ERROR(err);
+	
+    *nextFlag = readEvent;
+    // Register automatic cleanup
+    cl_mem buffers_to_cleanup[] = { outBuf, inputBuf };
+    cl_event events_to_cleanup[] = { writeEvent, execEvent };
+    registerCleanup(readEvent, buffers_to_cleanup, 2, events_to_cleanup, 2);
+
+
+
     //printf("ll : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
 }
 
-void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, cl_mem fc2_weight, cl_mem fc2_bias, cl_event* firstFlag, cl_event* secondFlag, cl_event* finalFlag)
+void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, cl_mem fc2_weight, cl_mem fc2_bias, cl_event* firstFlag, int firstFlagCount, cl_event* finalFlag)
 {
     int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1; // 197
     int Embed_dim = embed_dim;                                            // 768
@@ -526,76 +866,78 @@ void mlp_block(float *input, float *output, cl_mem fc1_weight, cl_mem fc1_bias, 
 
     float *fc1_out = (float *)malloc(sizeof(float) * tokens * hidden_dim);
 	if (fc1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+
+    cl_event innerEvent;
     
-    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true, firstFlag, 1, secondFlag); 
-    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false,secondFlag, 1, finalFlag);
+    linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias, true, firstFlag, firstFlagCount, &innerEvent);
+    linear_layer(fc1_out, output, tokens, hidden_dim, embed_dim, fc2_weight, fc2_bias, false, &innerEvent, 1, finalFlag);
     if (findNaN(output, tokens, embed_dim)) printf("ll asdf is nan\n");
     free(fc1_out);
 }
 
 ////////////////////////////////////// Encoder Architecture //////////////////////////////////////
-void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent, 
-             cl_mem ln1_w, cl_mem ln1_b, cl_mem attn_w, cl_mem attn_b, 
-             cl_mem attn_out_w, cl_mem attn_out_b, cl_mem ln2_w, cl_mem ln2_b, 
-             cl_mem mlp1_w, cl_mem mlp1_b, cl_mem mlp2_w, cl_mem mlp2_b)
-{
-
-
-    int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-    float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
-	if (ln1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
-    float *attn_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
-	if (attn_out== NULL) printf("malloc failed in line %d\n", __LINE__);
-    float *residual = (float *)malloc(sizeof(float) * tokens * embed_dim);
-	if (residual== NULL) printf("malloc failed in line %d\n", __LINE__);
-    float *ln2_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
-	if (ln2_out== NULL) printf("malloc failed in line %d\n", __LINE__);
-    float *mlp_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
-	if (mlp_out== NULL) printf("malloc failed in line %d\n", __LINE__);
-
-    //if (encoderCount == 0) printf("%d\n", encoderCount);
-    
-    int flagStartIndex = 12 * encoderCount;
-    clEnqueueMarkerWithWaitList(EXEC_COMMAND_QUEUE, 12, currentlyLoadingEvent, &ENCODER_FLAGS[flagStartIndex]); // dummy
-
-    /*LN1*/
-    layer_norm(input, ln1_out, ln1_w, ln1_b, &ENCODER_FLAGS[flagStartIndex], 1, &ENCODER_FLAGS[flagStartIndex + 1]);
-    //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 1 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
-
-    /*Attn*/
-    multihead_attn(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b, &ENCODER_FLAGS[flagStartIndex + 1], 1,&ENCODER_FLAGS[flagStartIndex + 2]);
-    //if (findNaN(ln1_out, tokens, embed_dim)) printf("multihead is nan on %d, encoder:%d\n", __LINE__, encoderCount);
-
-    /*Residual1*/
-    time_t residualTime = clock();
-    for (int i = 0; i < tokens * embed_dim; i++)
-    {
-        residual[i] = input[i] + attn_out[i];
-    }
-    totalResidualTime += (double)(clock() - residualTime) / CLK_TCK;
-    /*LN2*/
-    layer_norm(residual, ln2_out, ln2_w, ln2_b, &ENCODER_FLAGS[flagStartIndex + 2], 1, &ENCODER_FLAGS[flagStartIndex + 3]);
-    //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 2 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
-
-    /*MLP*/
-
-    mlp_block(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b , &ENCODER_FLAGS[flagStartIndex + 3],  &ENCODER_FLAGS[flagStartIndex + 4], &ENCODER_FLAGS[flagStartIndex + 5]);
-
-    /*Residual2*/
-    residualTime = clock();
-    for (int i = 0; i < tokens * embed_dim; i++)
-    {
-        output[i] = residual[i] + mlp_out[i];
-    }
-    totalResidualTime += (double)(clock() - residualTime) / CLK_TCK;
-    free(ln1_out);
-    free(attn_out);
-    free(residual);
-    free(ln2_out);
-    free(mlp_out);
-    
-    encoderCount = (encoderCount + 1) % 12;
-}
+//void Encoder(float *input, float *output, cl_event* currentlyLoadingEvent, 
+//             cl_mem ln1_w, cl_mem ln1_b, cl_mem attn_w, cl_mem attn_b, 
+//             cl_mem attn_out_w, cl_mem attn_out_b, cl_mem ln2_w, cl_mem ln2_b, 
+//             cl_mem mlp1_w, cl_mem mlp1_b, cl_mem mlp2_w, cl_mem mlp2_b)
+//{
+//
+//
+//    int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
+//    float *ln1_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+//	if (ln1_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+//    float *attn_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+//	if (attn_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+//    float *residual = (float *)malloc(sizeof(float) * tokens * embed_dim);
+//	if (residual== NULL) printf("malloc failed in line %d\n", __LINE__);
+//    float *ln2_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+//	if (ln2_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+//    float *mlp_out = (float *)malloc(sizeof(float) * tokens * embed_dim);
+//	if (mlp_out== NULL) printf("malloc failed in line %d\n", __LINE__);
+//
+//    //if (encoderCount == 0) printf("%d\n", encoderCount);
+//    
+//    int flagStartIndex = 12 * encoderCount;
+//    clEnqueueMarkerWithWaitList(EXEC_COMMAND_QUEUE, 12, currentlyLoadingEvent, &ENCODER_FLAGS[flagStartIndex]); // dummy
+//
+//    /*LN1*/
+//    layer_norm(input, ln1_out, ln1_w, ln1_b, &ENCODER_FLAGS[flagStartIndex], 1, &ENCODER_FLAGS[flagStartIndex + 1]);
+//    //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 1 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
+//
+//    /*Attn*/
+//    multihead_attn(ln1_out, attn_out, attn_w, attn_b, attn_out_w, attn_out_b, &ENCODER_FLAGS[flagStartIndex + 1], 1,&ENCODER_FLAGS[flagStartIndex + 2]);
+//    //if (findNaN(ln1_out, tokens, embed_dim)) printf("multihead is nan on %d, encoder:%d\n", __LINE__, encoderCount);
+//
+//    /*Residual1*/
+//    time_t residualTime = clock();
+//    for (int i = 0; i < tokens * embed_dim; i++)
+//    {
+//        residual[i] = input[i] + attn_out[i];
+//    }
+//    totalResidualTime += (double)(clock() - residualTime) / CLK_TCK;
+//    /*LN2*/
+//    layer_norm(residual, ln2_out, ln2_w, ln2_b, &ENCODER_FLAGS[flagStartIndex + 2], 1, &ENCODER_FLAGS[flagStartIndex + 3]);
+//    //if (findNaN(ln1_out, tokens, embed_dim)) printf("ln 2 is nan on %d, encoder:%d\n", __LINE__, encoderCount);
+//
+//    /*MLP*/
+//
+//    mlp_block(ln2_out, mlp_out, mlp1_w, mlp1_b, mlp2_w, mlp2_b , &ENCODER_FLAGS[flagStartIndex + 3],  &ENCODER_FLAGS[flagStartIndex + 4], &ENCODER_FLAGS[flagStartIndex + 5]);
+//
+//    /*Residual2*/
+//    residualTime = clock();
+//    for (int i = 0; i < tokens * embed_dim; i++)
+//    {
+//        output[i] = residual[i] + mlp_out[i];
+//    }
+//    totalResidualTime += (double)(clock() - residualTime) / CLK_TCK;
+//    free(ln1_out);
+//    free(attn_out);
+//    free(residual);
+//    free(ln2_out);
+//    free(mlp_out);
+//    
+//    encoderCount = (encoderCount + 1) % 12;
+//}
 
 void Softmax(float *logits, float *probabilities, int length)
 {
@@ -622,6 +964,76 @@ void Softmax(float *logits, float *probabilities, int length)
     {
         probabilities[i] /= sum_exp;
     }
+}
+
+
+
+void runEncoderLayerAsync(ImagePipelineState* state,
+    EncoderWeights* weights,
+    int layer_idx,
+    cl_event* waitEvent, int numWaitEvents,
+    cl_event* complete) {
+    int tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
+    cl_int err;
+
+    float* input = state->enc_layer[layer_idx];
+    float* output = state->enc_layer[layer_idx + 1];
+
+    // Use persistent buffers from state
+    cl_mem inputBuf = state->input_buf;
+    cl_mem outputBuf = state->output_buf;
+
+    // Create temporary CPU buffers
+    float* ln1_out = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    float* attn_out = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    float* residual = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    float* ln2_out = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    float* mlp_out = (float*)malloc(sizeof(float) * tokens * embed_dim);
+
+    // Execute layer operations with event dependencies
+    cl_event ln1_event, attn_event, ln2_event, mlp_event;
+
+    layer_norm(input, ln1_out, weights->ln1_w, weights->ln1_b,
+        waitEvent, numWaitEvents, &ln1_event);
+
+    multihead_attn(ln1_out, attn_out,
+        weights->attn_w, weights->attn_b,
+        weights->attn_out_w, weights->attn_out_b,
+        state->qkv_buf, state->attn_buf,
+        &ln1_event, 1, &attn_event);
+
+    // Residual connection (wait for attention)
+    clWaitForEvents(1, &attn_event);
+    for (int i = 0; i < tokens * embed_dim; i++) {
+        residual[i] = input[i] + attn_out[i];
+    }
+
+    layer_norm(residual, ln2_out, weights->ln2_w, weights->ln2_b,
+        NULL, 0, &ln2_event);
+
+    mlp_block(ln2_out, mlp_out,
+        weights->mlp1_w, weights->mlp1_b,
+        weights->mlp2_w, weights->mlp2_b,
+        &ln2_event, 1, &mlp_event);
+
+    // Final residual (wait for MLP)
+    clWaitForEvents(1, &mlp_event);
+    for (int i = 0; i < tokens * embed_dim; i++) {
+        output[i] = residual[i] + mlp_out[i];
+    }
+
+    *complete = mlp_event;
+
+    // Cleanup
+    clReleaseEvent(ln1_event);
+    clReleaseEvent(attn_event);
+    clReleaseEvent(ln2_event);
+
+    free(ln1_out);
+    free(attn_out);
+    free(residual);
+    free(ln2_out);
+    free(mlp_out);
 }
 
 ////////////////////////////////////// layer별 size //////////////////////////////////////
@@ -739,65 +1151,142 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(err);
 	
     printf("setup time: %.6f sec\n\n" , (double)(clock() - setupTime) / CLK_TCK);
-    //printSpec();
 
-    EncoderWeights encoderWeightBuffers[2];
+    const int NUM_ENCODERS = 12;
+
+    // Initialize weight pipeline
+    WeightPipelineState weightPipeline;
+    for (int i = 0; i < ENCODER_PIPELINE_DEPTH; i++) {
+        weightPipeline.weights[i] = initEncoderWeightPipelined();
+    }
+    weightPipeline.next_load_idx = 0;
+
+    // Pre-load first encoder weights
+    for (int i = 0; i < ENCODER_PIPELINE_DEPTH && i < NUM_ENCODERS; i++) {
+        fillEncoderWeightAsync(&weightPipeline.weights[i], networks, i, NULL, 0);
+    }
+
+    // Initialize image pipeline states
+    ImagePipelineState* imageStates[MAX_IMAGES_IN_FLIGHT];
+    for (int i = 0; i < MAX_IMAGES_IN_FLIGHT; i++) {
+        imageStates[i] = NULL;
+    }
+
+    // Initialize final weights (shared across all images)
     FinalWeight finalWeights = initFinalWeight(networks);
-    encoderWeightBuffers[0] = initEncoderWeight();
-    encoderWeightBuffers[1] = initEncoderWeight();
-
-    cl_event pingEvent[24];
-    cl_event pongEvent[24];
-
-    cl_event* pingPongEvent[] = {pingEvent, pongEvent};
-
     fillFinalWeight(finalWeights, networks);
-    for (int i = 0; i < image->n; i++)
-    {
-        double startTime = clock();
-        /*patch embedding*/
-        Conv2d(image[i].data, layer[0], networks[1], networks[2]);
-        /*flatten and transpose*/
-        flatten_transpose(layer[0], layer[1]);
-        /*prepend class token*/
-        class_token(layer[1], layer[2], networks[0]);
-        /*position embedding*/
-        pos_emb(layer[2], enc_layer[0], networks[3]); 
-        printf("pre-processing : %.6f sec\n", (double)(clock() - startTime) / CLK_TCK);
-        /*Encoder - 12 Layers*/
-        cl_event encoderWeightLoadingEvent[2][24];
 
-        fillEncoderWeight(encoderWeightBuffers[0], networks, 0, encoderWritingPipe[0],pingPongEvent[0]);
-        for (int j = 0; j < 12; j++) {
-            if (j + 1 < 12) 
-				fillEncoderWeight(encoderWeightBuffers[(j + 1) % 2], networks, j + 1, encoderWritingPipe[(j + 1) % 2], pingPongEvent[(j+1) % 2]);
-            Encoder(enc_layer[j], enc_layer[j + 1], pingPongEvent[j % 2],
-                encoderWeightBuffers[j%2].ln1_w, encoderWeightBuffers[j%2].ln1_b, encoderWeightBuffers[j%2].attn_w, encoderWeightBuffers[j%2].attn_b,
-                encoderWeightBuffers[j%2].attn_out_w, encoderWeightBuffers[j%2].attn_out_b, encoderWeightBuffers[j%2].ln2_w, encoderWeightBuffers[j%2].ln2_b,
-                encoderWeightBuffers[j%2].mlp1_w, encoderWeightBuffers[j%2].mlp1_b, encoderWeightBuffers[j%2].mlp2_w, encoderWeightBuffers[j%2].mlp2_b);
+    int next_image_to_start = 0;
+    int images_completed = 0;
+    // Main pipeline loop
+    while (images_completed < image->n) {
 
+        // Try to start new images
+        for (int slot = 0; slot < MAX_IMAGES_IN_FLIGHT; slot++) {
+            if (imageStates[slot] == NULL && next_image_to_start < image->n) {
+                // Start preprocessing new image
+                imageStates[slot] = createImagePipelineState(next_image_to_start);
+
+                printf("Starting image %d in slot %d\n", next_image_to_start, slot);
+
+                cl_event preprocess_event;
+                preprocessImageAsync(&image[next_image_to_start],
+                    imageStates[slot], networks, &preprocess_event);
+
+                imageStates[slot]->processing = true;
+                imageStates[slot]->current_encoder = 0;
+
+                next_image_to_start++;
+            }
         }
 
-        for (int asdf = 0; asdf <= 12; asdf += 1)
-            if (findNaN(enc_layer[asdf], 197, embed_dim)) printf("%d has nan", asdf);
-        
-        layer_norm(enc_layer[12], enc_output, finalWeights.ln_w, finalWeights.ln_b, &ENCODER_FLAGS[60], 1, FINAL_FLAG);
+        // Process encoder layers for all active images
+        for (int slot = 0; slot < MAX_IMAGES_IN_FLIGHT; slot++) {
+            ImagePipelineState* state = imageStates[slot];
 
-        /* Token 값 추출 */
-        float *cls_token = (float *)malloc(sizeof(float) * embed_dim);
-        if (cls_token == NULL) printf("malloc failed on %d\n", __LINE__);
-        float *cls_output = (float *)malloc(sizeof(float) * num_classes);
-        if (cls_output == NULL) printf("malloc failed\n");
-        memcpy(cls_token, enc_output, sizeof(float) * embed_dim);
+            if (state == NULL || !state->processing) continue;
 
-        linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, finalWeights.mlp_w, finalWeights.mlp_b, false, FINAL_FLAG, 1, NULL);
-        /* 확률분포 추출 */
-        Softmax(cls_output, probabilities[i], num_classes);
+            int layer = state->current_encoder;
 
-        printf("picture #%d: %.6f sec\n\n", i, (double)(clock() - startTime) / CLK_TCK);
+            if (layer < NUM_ENCODERS) {
+                // Check if previous layer completed
+                cl_event* waitEvent = (layer > 0) ? &state->encoderComplete[layer - 1] : NULL;
+                int numWait = (layer > 0) ? 1 : 0;
+
+                // Get weight buffer for this layer
+                int weight_idx = layer % ENCODER_PIPELINE_DEPTH;
+                EncoderWeights* weights = &weightPipeline.weights[weight_idx];
+
+                // Wait for weights to be loaded
+                clWaitForEvents(1, &weights->writeComplete);
+
+                printf("  Image %d: Processing encoder layer %d\n",
+                    state->image_idx, layer);
+
+                // Run encoder layer
+                runEncoderLayerAsync(state, weights, layer,
+                    waitEvent, numWait,
+                    &state->encoderComplete[layer]);
+
+                state->current_encoder++;
+
+                // Start loading next encoder weights if needed
+                int next_weight_layer = layer + ENCODER_PIPELINE_DEPTH;
+                if (next_weight_layer < NUM_ENCODERS) {
+                    int next_weight_idx = next_weight_layer % ENCODER_PIPELINE_DEPTH;
+
+                    // Wait for previous usage of this buffer slot
+                    int prev_layer = next_weight_layer - ENCODER_PIPELINE_DEPTH;
+                    if (prev_layer >= 0) {
+                        clWaitForEvents(1, &state->encoderComplete[prev_layer]);
+                    }
+
+                    fillEncoderWeightAsync(&weightPipeline.weights[next_weight_idx],
+                        networks, next_weight_layer, NULL, 0);
+                }
+            }
+            else {
+                // All encoders done, finish image
+                printf("  Image %d: Finalizing\n", state->image_idx);
+
+                // Wait for last encoder
+                clWaitForEvents(1, &state->encoderComplete[NUM_ENCODERS - 1]);
+                cl_event finalEvent;
+                // Final layer norm
+                layer_norm(state->enc_layer[12], state->enc_output,
+                    finalWeights.ln_w, finalWeights.ln_b,NULL, 0, &finalEvent);
+
+                cl_event finalLLEvent;
+                // Extract class token and classify
+                memcpy(state->cls_token, state->enc_output, sizeof(float) * embed_dim);
+                linear_layer(state->cls_token, state->cls_output, 1, embed_dim,
+                    num_classes, finalWeights.mlp_w, finalWeights.mlp_b, false, &finalEvent, 1 ,&finalLLEvent);
+
+                // 2. Wait when you need the result
+                clWaitForEvents(1, &finalLLEvent);
+
+                // 3. Release the event YOU received
+                clReleaseEvent(finalLLEvent);
+                // Softmax
+                Softmax(state->cls_output, probabilities[state->image_idx], num_classes);
+
+                printf("Image %d completed!\n", state->image_idx);
+
+                // Release this slot
+                releaseImagePipelineState(state);
+                imageStates[slot] = NULL;
+                images_completed++;
+            }
+        }
+
+        // Small yield to prevent busy-waiting
+        // (In production, use better synchronization)
     }
-    //printEventProfile();
 
+    // Cleanup
+    for (int i = 0; i < ENCODER_PIPELINE_DEPTH; i++) {
+        releaseEncoderWeightsPipelined(&weightPipeline.weights[i]);
+    }
     CHECK_ERROR(clReleaseKernel(LL_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_KERNEL));
     CHECK_ERROR(clReleaseKernel(QKV_TO_SCOREV_KERNEL));
@@ -810,265 +1299,12 @@ void ViT_opencl(ImageData *image, Network *networks, float **probabilities)
 	CHECK_ERROR(clReleaseCommandQueue(WRITE_COMMAND_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(EXEC_COMMAND_QUEUE));
     CHECK_ERROR(clReleaseCommandQueue(READ_COMMAND_QUEUE));
-    releaseEncoderWeights(encoderWeightBuffers[0]);
-    releaseEncoderWeights(encoderWeightBuffers[1]);
     releaseFinalWeights(finalWeights);
     err = clReleaseContext(CONTEXT);
 
     CHECK_ERROR(err);
 }
 
-EncoderWeights initEncoderWeight() {
-    EncoderWeights weights;
-	cl_int err;
-    int hidden_dim = ((int)(embed_dim * mlp_ratio));
-
-    weights.ln1_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.ln1_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.attn_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * embed_dim * 3, NULL, &err);
-    CHECK_ERROR(err);
-    weights.attn_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * 3, NULL, &err);
-    CHECK_ERROR(err);
-    weights.attn_out_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.attn_out_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.ln2_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.ln2_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.mlp1_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * hidden_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.mlp1_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * hidden_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.mlp2_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim * hidden_dim, NULL, &err);
-    CHECK_ERROR(err);
-    weights.mlp2_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * embed_dim, NULL, &err);
-    CHECK_ERROR(err);
-    return weights;
-}
-
-void fillEncoderWeight(EncoderWeights weights, Network* networkList, int encoderIndex, cl_command_queue writingPipe, cl_event* writeEvents) {
-    cl_int err;
-    int base = 4 + encoderIndex * 12;
-    err = clEnqueueWriteBuffer(writingPipe, weights.ln1_w, CL_FALSE, 0,
-        sizeof(float) * networkList[base].size,
-        networkList[base].data, 0, NULL, &writeEvents[0]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.ln1_b, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 1].size,
-        networkList[base + 1].data, 0, NULL, &writeEvents[1]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.attn_w, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 2].size,
-        networkList[base + 2].data, 0, NULL, &writeEvents[2]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.attn_b, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 3].size,
-        networkList[base + 3].data, 0, NULL, &writeEvents[3]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.attn_out_w, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 4].size,
-        networkList[base + 4].data, 0, NULL, &writeEvents[4]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.attn_out_b, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 5].size,
-        networkList[base + 5].data, 0, NULL, &writeEvents[5]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.ln2_w, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 6].size,
-        networkList[base + 6].data, 0, NULL, &writeEvents[6]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.ln2_b, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 7].size,
-        networkList[base + 7].data, 0, NULL, &writeEvents[7]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.mlp1_w, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 8].size,
-        networkList[base + 8].data, 0, NULL, &writeEvents[8]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.mlp1_b, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 9].size,
-        networkList[base + 9].data, 0, NULL, &writeEvents[9]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.mlp2_w, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 10].size,
-        networkList[base + 10].data, 0, NULL, &writeEvents[10]);
-    CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(writingPipe, weights.mlp2_b, CL_FALSE, 0,
-        sizeof(float) * networkList[base + 11].size,
-        networkList[base + 11].data, 0, NULL, &writeEvents[11]);
-    CHECK_ERROR(err);
-}
-
-void releaseEncoderWeights(EncoderWeights weights) {
-    clReleaseMemObject(weights.ln1_w);
-    clReleaseMemObject(weights.ln1_b);
-    clReleaseMemObject(weights.attn_w);
-    clReleaseMemObject(weights.attn_b);
-    clReleaseMemObject(weights.attn_out_w);
-    clReleaseMemObject(weights.attn_out_b);
-    clReleaseMemObject(weights.ln2_w);
-    clReleaseMemObject(weights.ln2_b);
-    clReleaseMemObject(weights.mlp1_w);
-    clReleaseMemObject(weights.mlp1_b);
-    clReleaseMemObject(weights.mlp2_w);
-    clReleaseMemObject(weights.mlp2_b);
-}
-
-FinalWeight initFinalWeight(Network* networkList) {
-    FinalWeight weights;
-    cl_int err;
-
-	weights.ln_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[148].size, NULL, &err);
-	CHECK_ERROR(err);
-	weights.ln_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[149].size, NULL, &err);
-    CHECK_ERROR(err);
-	weights.mlp_w = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[150].size, NULL, &err);
-	CHECK_ERROR(err);
-	weights.mlp_b = clCreateBuffer(CONTEXT, CL_MEM_READ_WRITE, sizeof(float) * networkList[151].size, NULL, &err);
-	CHECK_ERROR(err);
-
-    return weights;
-}
-
-void fillFinalWeight(FinalWeight weights, Network* networkList) {
-    cl_int err;
-    
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln_w, CL_FALSE, 0, sizeof(float) * networkList[148].size, networkList[148].data, 0, NULL, NULL);
-	CHECK_ERROR(err);
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.ln_b, CL_FALSE, 0, sizeof(float) * networkList[149].size, networkList[149].data, 0, NULL, NULL);
-	CHECK_ERROR(err);
-    err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp_w, CL_FALSE, 0, sizeof(float) * networkList[150].size, networkList[150].data, 0, NULL, NULL);
-	CHECK_ERROR(err);
-	err = clEnqueueWriteBuffer(WRITE_COMMAND_QUEUE, weights.mlp_b, CL_FALSE, 0, sizeof(float) * networkList[151].size, networkList[151].data, 0, NULL, NULL);
-	CHECK_ERROR(err);
-
-    clFinish(WRITE_COMMAND_QUEUE);
-}
-
-void releaseFinalWeights(FinalWeight weights) {
-    clReleaseMemObject(weights.ln_w);
-    clReleaseMemObject(weights.ln_b);
-    clReleaseMemObject(weights.mlp_w);
-    clReleaseMemObject(weights.mlp_b);
-}
-
-
-void printSpec() {
-    cl_uint num_platforms;
-    cl_platform_id *platforms;
-    cl_uint num_devices;
-    cl_device_id *devices;
-    char str[1024];
-    cl_device_type device_type;
-    size_t max_work_group_size;
-    cl_uint max_clock_frequency;
-    cl_ulong global_mem_size;
-    cl_ulong local_mem_size;
-    cl_ulong max_mem_alloc_size;
-    cl_ulong max_compute_units;
-    cl_command_queue_properties queue_properties;
-    cl_uint p, d;
-    cl_int err;
-
-    err = clGetPlatformIDs(0, NULL, &num_platforms);
-    CHECK_ERROR(err);
-
-    platforms = (cl_platform_id *)malloc(sizeof(cl_platform_id) * num_platforms);
-    err = clGetPlatformIDs(num_platforms, platforms, NULL);
-    CHECK_ERROR(err);
-
-    printf("Number of platforms: %u\n\n", num_platforms);
-    for (p = 0; p < num_platforms; p++)
-    {
-        printf("platform: %u\n", p);
-
-        err = clGetPlatformInfo(platforms[p], CL_PLATFORM_NAME, 1024, str, NULL);
-        CHECK_ERROR(err);
-        printf("- CL_PLATFORM_NAME\t:%s\n", str);
-
-        err = clGetPlatformInfo(platforms[p], CL_PLATFORM_VENDOR, 1024, str, NULL);
-        CHECK_ERROR(err);
-        printf("- CL_PLATFORM_VENDOR\t:%s\n\n", str);
-
-        err = clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, 0, NULL, &num_devices);
-        CHECK_ERROR(err);
-        printf("Number of devices:\t%u\n\n", num_devices);
-
-        devices = (cl_device_id *)malloc(sizeof(cl_device_id) * num_devices);
-        err = clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, num_devices, devices, NULL);
-        CHECK_ERROR(err);
-
-        for (d = 0; d < num_devices; d++)
-        {
-            printf("device: %u\n", d);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_TYPE, sizeof(cl_device_type), &device_type, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_TYPE\t:");
-            if (device_type & CL_DEVICE_TYPE_CPU)
-                printf(" CL_DEVICE_TYPE_CPU");
-            if (device_type & CL_DEVICE_TYPE_GPU)
-                printf(" CL_DEVICE_TYPE_GPU");
-            if (device_type & CL_DEVICE_TYPE_ACCELERATOR)
-                printf(" CL_DEVICE_TYPE_ACCELERATOR");
-            if (device_type & CL_DEVICE_TYPE_DEFAULT)
-                printf(" CL_DEVICE_TYPE_DEFAULT");
-            if (device_type & CL_DEVICE_TYPE_CUSTOM)
-                printf(" CL_DEVICE_TYPE_CUSTOM");
-            printf("\n");
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_NAME, 1024, str, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_NAME\t: %s\n", str);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_VENDOR, 1024, str, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_VENDOR\t: %s\n", str);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_VERSION, 1024, str, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_VERSION\t: %s\n", str);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(cl_ulong), &max_clock_frequency, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_MAX_CLOCK_FREQUENCY : %luMHz\n", max_clock_frequency);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_ulong), &max_compute_units, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_MAX_COMPUTE_UNITS : %lu\n", max_compute_units);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &max_work_group_size, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_MAX_WORK_GROUP_SIZE : %lu\n", max_work_group_size);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem_size, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_GLOBAL_MEM_SIZE : %lu\n", global_mem_size);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &local_mem_size, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_LOCAL_MEM_SIZE : %lu\n", local_mem_size);
-
-            err = clGetDeviceInfo(devices[d], CL_DEVICE_QUEUE_PROPERTIES, sizeof(cl_ulong), &queue_properties, NULL);
-            CHECK_ERROR(err);
-            printf("- CL_DEVICE_QUEUE_PROPERTIES :");
-            if (queue_properties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE)
-                printf(" CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE");
-            if (queue_properties & CL_QUEUE_PROFILING_ENABLE)
-                printf(" CL_QUEUE_PROFILING_ENABLE");
-            printf("\n");
-        }
-
-        free(devices);
-    }
-
-    free(platforms);
-    return 0;
-}
 
 void profileEvents(cl_event *events, int eventCount, cl_ulong* timeGlobalVariable) { 
     cl_ulong start, end, minStart = ULLONG_MAX, maxEnd = 0;
@@ -1238,86 +1474,3 @@ bool findNaN(float* a, int tokens, int embedings) {
 
     return false;
 }
-//void test_linear_layer(){
-//    // Simple 3×2 input, 2×4 weight
-//    float input[6] = {1, 2,  3, 4,  5, 6};       // [3, 2]
-//    float weight[8] = {1, 0, 0, 1,  0, 1, 1, 0}; // [4, 2]
-//    //float bias[4] = {1, 1, 1, 1};
-//    float bias[4] = {0, 0, 0, 0};
-//    float output[12];  // [3, 4]
-//
-//
-//    Network weight_net = { weight, 8 };
-//    Network bias_net = { bias, 4 };
-//    
-//    // Expected output:
-//    // [1, 2, 2, 1]
-//    // [3, 4, 4, 3]
-//    // [5, 6, 6, 5]
-//    
-//    // Run your kernel
-//    linear_layer(input, output, 3, 2, 4, weight_net, bias_net, false);
-//    
-//    // Check results
-//    printf("Output:\n");
-//    for (int i = 0; i < 3; i++) {
-//        for (int j = 0; j < 4; j++) {
-//            printf("%.1f ", output[i * 4 + j]);
-//        }
-//        printf("\n");
-//    }
-//}
-//
-
-//void test_linear_layer_big(){
-//    float input[17 * 32];    
-//    float weight[32 * 32];
-//    float bias[32] = { 0 };
-//    float output[32 * 32];
-//
-//    for (int i = 0; i < 17; i++) {
-//        for (int j = 0; j < 32; j++) {
-//            input[i * 32 + j] = 1;
-//        }
-//    }
-//    for (int i = 0; i < 32; i++) {
-//		for (int j = 0; j < 32; j++) {
-//			weight[i * 32 + j] = i;
-//		}
-//	}
-//
-//    Network weight_net = { weight, 32*32 };
-//    Network bias_net = { bias, 32 };
-//    
-//    // Expected output:
-//    
-//    // Run your kernel
-//    linear_layer(input, output, 17, 32, 32, weight_net, bias_net, false);
-//    
-//    // Check results
-//    if (findNaN(output, 17, 32)){
-//		printf("found Nan during testing");
-//        return;
-//    }
-//
-//    printf("Output:\n");
-//    for (int i = 0; i < 17; i++) {
-//		for (int j = 0; j < 32; j++) {
-//            printf("%.1f ", output[i * 32 + j]);
-//		}
-//        printf("\n");
-//	}
-//
-//
-//
-//    for (int i = 0; i < 17; i++) {
-//        for (int j = 0; j < 32; j++) {
-//            if (output[i * 32 + j] != 32 * j) {
-//                printf("wrong anwer(%f) on %d %d\n", output[i * 32 + j], i, j);
-//                return;
-//            }
-//        }
-//    }
-//
-//    printf("all good!\n");
-//}
