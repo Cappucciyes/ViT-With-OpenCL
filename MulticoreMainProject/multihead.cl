@@ -1,4 +1,4 @@
-﻿#define TILESIZE 16
+﻿#define TILESIZE 8
 
 __kernel void QKV(
     __global float* input,

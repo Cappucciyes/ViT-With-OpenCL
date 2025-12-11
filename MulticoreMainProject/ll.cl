@@ -1,4 +1,4 @@
-#define TILESIZE 16
+#define TILESIZE 8
 
 float gelu(float x) {
     return 0.5 * x * (1.0 + erf(x / sqrt(2.0)));

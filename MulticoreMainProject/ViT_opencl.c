@@ -507,7 +507,7 @@ void multihead_attn(cl_mem input, cl_mem output,cl_mem QKV_BUF, cl_mem ATTN_BUF,
     err = clSetKernelArg(QKV_KERNEL, 5, sizeof(cl_int), &middleSize);
 	CHECK_ERROR(err);
 
-    int tileSize = 16;
+    int tileSize = 8;
     size_t global_size[] = {
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
         ((embed_dim + tileSize - 1) / tileSize) * tileSize,
@@ -588,7 +588,7 @@ void multihead_attn(cl_mem input, cl_mem output,cl_mem QKV_BUF, cl_mem ATTN_BUF,
     err = clSetKernelArg(LL_KERNEL, 7, sizeof(cl_int), &doGelu);
 	CHECK_ERROR(err);
 
-    tileSize = 16;
+    tileSize = 8;
     size_t global_LL_size[] = {
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
         ((embed_dim + tileSize - 1) / tileSize) * tileSize
@@ -645,7 +645,7 @@ void linear_layer(cl_mem input, cl_mem output, int tokens, int in_features, int 
     err = clSetKernelArg(LL_KERNEL, 7, sizeof(cl_int), &activateGelu);
 	CHECK_ERROR(err); 
 
-    int tileSize = 16;
+    int tileSize = 8;
 	size_t global_size[] = {
         ((tokens + tileSize - 1) / tileSize) * tileSize,        // Round up to multiple of 16
         ((out_features + tileSize - 1) / tileSize) * tileSize
